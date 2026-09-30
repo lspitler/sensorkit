@@ -3,6 +3,7 @@
 
 import io
 import json
+import uuid
 import zipfile
 from datetime import UTC, datetime
 
@@ -200,6 +201,28 @@ class TestSkyImageryMetadata:
         metadata = uploaded_metadata(program)
         assert metadata["idRequest"] == request.id
         assert metadata["imageSetId"] == "sk-task-7"
+
+    @pytest.mark.asyncio
+    async def test_id_is_a_client_set_uuid(self, program):
+        """The client sets the SkyImagery id (a UUID) and records it for the EO link."""
+        await publish_frame(program, tle_request())
+
+        metadata = uploaded_metadata(program)
+        assert uuid.UUID(metadata["id"]).version == 7
+        assert program.state.sky_imagery_ids["test.fits"] == metadata["id"]
+
+    @pytest.mark.asyncio
+    async def test_ids_are_unique_per_frame(self, program):
+        request = tle_request(num_frames=2)
+        await publish_frame(program, request, name="a.fits")
+        await publish_frame(program, request, name="b.fits")
+        assert uploaded_metadata(program, 0)["id"] != uploaded_metadata(program, 1)["id"]
+
+    @pytest.mark.asyncio
+    async def test_id_not_recorded_when_upload_fails(self, program):
+        program._sky_imagery._upload.fail = RuntimeError("boom")
+        await publish_frame(program, tle_request())
+        assert "test.fits" not in program.state.sky_imagery_ids
 
     @pytest.mark.asyncio
     async def test_imageset_id_omitted_for_single_image(self, program):

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
+import uuid_utils.compat as uuid
 from loguru import logger
 from pydantic import TypeAdapter, ValidationError
 from unifieddatalibrary.types.observations.eo_observation_unvalidated_publish_params import (
@@ -110,8 +111,12 @@ class SkyImageryPublisher:
         frame_num = context.get("frame_num", 0)
         sequence_id = frame_num + 1
 
-        # Build SkyImagery metadata
+        # Build SkyImagery metadata. The id is set here, not by UDL, so the
+        # EOObservations from this frame can reference it as idSkyImagery. A UUIDv7
+        # keeps it unique across providers.
+        sky_imagery_id = str(uuid.uuid7())
         metadata = {
+            "id": sky_imagery_id,
             **provenance,
             "idSensor": program.config.api.id_sensor,
             "expStartTime": _to_udl_timestamp(exp_start_time),
@@ -169,6 +174,7 @@ class SkyImageryPublisher:
         zip_buffer.seek(0)
 
         await self._upload(zip_buffer.getvalue())
+        program.state.sky_imagery_ids[filename] = sky_imagery_id
         logger.debug(
             f"uploaded SkyImagery {sequence_id}/{image_set_length} for {ident}"
         )
@@ -533,6 +539,7 @@ class EOObservationPublisher:
                 "uct": True,
                 "exp_duration": result.exposure_time_seconds,
                 "descriptor": name,
+                "id_sky_imagery": program.state.sky_imagery_ids.get(name),
                 "mag": mags.get(band),
                 "mag_unc": errs.get(band),
                 **site_fields,
