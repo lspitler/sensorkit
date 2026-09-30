@@ -75,7 +75,6 @@ class SkyImageryPublisher:
         if request:
             ident = f"CollectRequest {request.id}"
             image_set_length = request.num_frames or 1
-            image_set_id = request.id
             provenance = {
                 "classificationMarking": request.classification_marking,
                 "dataMode": request.data_mode,
@@ -87,7 +86,6 @@ class SkyImageryPublisher:
         else:
             ident = "untasked frame"
             image_set_length = int(context.get("frame_count") or 1)
-            image_set_id = context.get("task_id")
             provenance = {
                 "classificationMarking": self._config.classification_marking,
                 "dataMode": self._config.data_mode,
@@ -99,6 +97,10 @@ class SkyImageryPublisher:
                 f"DataGraph context is missing {missing} for {ident}; "
                 f"check the udl entity's data_flow keyword_map"
             )
+
+        # imageSetId is our own ID for the frame set (the SensorKit task), separate
+        # from idRequest, which links to the CollectRequest.
+        image_set_id = context.get("task_id")
 
         filename = info.path.name
         exp_start_time = datetime.fromisoformat(context["date_obs"])
@@ -112,7 +114,6 @@ class SkyImageryPublisher:
         metadata = {
             **provenance,
             "idSensor": program.config.api.id_sensor,
-            "origSensorId": program.config.api.id_sensor,
             "expStartTime": _to_udl_timestamp(exp_start_time),
             "expEndTime": _to_udl_timestamp(exp_end_time),
             "imageSetLength": image_set_length,
@@ -488,6 +489,10 @@ class EOObservationPublisher:
                 "origin": request.origin,
                 "track_id": request.id,
                 "task_id": request.task_id,
+                # The tasked object, for UCT follow-up. The detection itself is not
+                # correlated, so uct stays True.
+                "orig_object_id": request.orig_object_id
+                or (str(request.sat_no) if request.sat_no is not None else None),
             }
         else:
             ident = "untasked result"
@@ -522,10 +527,9 @@ class EOObservationPublisher:
                 "ob_time": ob_time,
                 "source": program.config.api.source,
                 "id_sensor": program.config.api.id_sensor,
-                "orig_sensor_id": program.config.api.id_sensor,
                 "ra": ra,
                 "declination": declination,
-                "reference_frame": "J2000",
+                # UDL reads a null referenceFrame as J2000, the frame of ra/declination.
                 "uct": True,
                 "exp_duration": result.exposure_time_seconds,
                 "descriptor": name,

@@ -83,8 +83,8 @@ async def publish_frame(program, request, **context_fields):
     context_fields.setdefault("image_width", 2048)
     context_fields.setdefault("image_height", 2048)
     context_fields.setdefault("bits_per_pixel", 16)
+    context_fields.setdefault("task_id", request.id)
     context = frame_context(
-        task_id=request.id,
         frame_num=0,
         date_obs="2026-03-21T07:18:47.082000",
         **context_fields,
@@ -127,12 +127,13 @@ class TestSkyImageryMetadata:
 
     @pytest.mark.asyncio
     async def test_metadata_sensor_ids(self, program):
-        """idSensor and origSensorId both carry the configured sensor id, as on
-        CollectResponses and EOObservations; origObjectId is not stamped (satNo suffices)."""
+        """idSensor carries the configured sensor id; origSensorId would only repeat it,
+        and origObjectId is not stamped (satNo suffices)."""
         await publish_frame(program, tle_request())
 
         metadata = uploaded_metadata(program)
-        assert metadata["origSensorId"] == "SENSOR-01"
+        assert metadata["idSensor"] == "SENSOR-01"
+        assert "origSensorId" not in metadata
         assert "origObjectId" not in metadata
 
     @pytest.mark.asyncio
@@ -188,6 +189,17 @@ class TestSkyImageryMetadata:
         assert metadata["imageType"] == "FITS"
         # Multi-frame set (num_frames=3) → imageSetId associates the frames.
         assert metadata["imageSetId"] == request.id
+
+    @pytest.mark.asyncio
+    async def test_imageset_id_is_the_task_not_the_request(self, program):
+        """imageSetId is SensorKit's own set ID; idRequest carries the CollectRequest."""
+        request = tle_request(num_frames=3)
+        program.state.collect_request_ids["sk-task-7"] = request.id
+        await publish_frame(program, request, task_id="sk-task-7")
+
+        metadata = uploaded_metadata(program)
+        assert metadata["idRequest"] == request.id
+        assert metadata["imageSetId"] == "sk-task-7"
 
     @pytest.mark.asyncio
     async def test_imageset_id_omitted_for_single_image(self, program):
