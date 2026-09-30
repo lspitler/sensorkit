@@ -49,6 +49,13 @@ def _to_udl_timestamp(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def _tasked_object_id(request: CollectRequestFull) -> str | None:
+    """The CollectRequest's target as an origObjectId: its origObjectId, else its satNo."""
+    if request.orig_object_id:
+        return request.orig_object_id
+    return str(request.sat_no) if request.sat_no is not None else None
+
+
 class SkyImageryPublisher:
     """Uploads FITS frames to the UDL SkyImagery filedrop."""
 
@@ -497,8 +504,7 @@ class EOObservationPublisher:
                 "task_id": request.task_id,
                 # The tasked object, for UCT follow-up. The detection itself is not
                 # correlated, so uct stays True.
-                "orig_object_id": request.orig_object_id
-                or (str(request.sat_no) if request.sat_no is not None else None),
+                "orig_object_id": _tasked_object_id(request),
             }
         else:
             ident = "untasked result"
