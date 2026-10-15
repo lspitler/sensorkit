@@ -6,6 +6,8 @@ import importlib.util
 import inspect
 import pathlib
 import sys
+from importlib.machinery import ModuleSpec
+from types import ModuleType
 
 
 def get_caller_module(*, depth: int):
@@ -49,10 +51,19 @@ def module_from_file(path: pathlib.Path, name: str):
 
 
 def import_module_or_file(name: str):
-    """Import a module by name or path, handling relative imports within it."""
+    """Import a module by name or path, handling relative imports within it.
+
+    Importing the same path again returns the already loaded module.
+    """
     path = pathlib.Path(name)
 
     if path.exists():
+        match sys.modules.get(path.stem):
+            case ModuleType(__spec__=ModuleSpec(origin=str(origin))) as module if (
+                pathlib.Path(origin).resolve() == path.resolve()
+            ):
+                return module
+
         module = module_from_file(path, path.stem)
         sys.modules[path.stem] = module
         return module
