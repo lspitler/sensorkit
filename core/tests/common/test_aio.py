@@ -327,6 +327,284 @@ async def test_async_observer_drops_oldest_when_full():
 
 
 @pytest.mark.asyncio
+async def test_async_observer_rejects_unknown_overflow_policy():
+    obs = AsyncObserver(0)
+
+    with pytest.raises(ValueError):
+        obs.subscribe(overflow="newest")
+
+    assert obs.subscriber_count == 0
+
+
+@pytest.mark.asyncio
+async def test_async_observer_overflow_closes_only_that_subscriber():
+    obs = AsyncObserver(0)
+    closing = obs.subscribe(maxsize=2, overflow="close")
+    dropping = obs.subscribe(maxsize=2)
+    roomy = obs.subscribe()
+
+    for value in (1, 2, 3):
+        obs.notify(value)
+
+    # Both queued values and the incoming one are lost to the closed subscriber.
+    assert obs.dropped == 3 + 1
+    assert obs.subscriber_count == 2
+    assert not obs.closed
+    assert obs.value == 3
+
+    # Pending values are discarded rather than left as incomplete history.
+    with pytest.raises(asyncio.QueueShutDown):
+        closing.get_nowait()
+
+    assert [dropping.get_nowait() for _ in range(2)] == [2, 3]
+    assert [roomy.get_nowait() for _ in range(3)] == [1, 2, 3]
+
+    # The observer stays open for the remaining subscribers.
+    obs.notify(4)
+    assert dropping.get_nowait() == 4
+    assert roomy.get_nowait() == 4
+
+
+@pytest.mark.asyncio
+async def test_async_observer_overflow_counts_initial_value():
+    obs = AsyncObserver(0)
+    queue = obs.subscribe(initial_value=True, maxsize=1, overflow="close")
+
+    obs.notify(1)
+
+    assert obs.dropped == 2
+    assert obs.subscriber_count == 0
+
+    with pytest.raises(asyncio.QueueShutDown):
+        queue.get_nowait()
+
+
+@pytest.mark.asyncio
+async def test_async_observer_overflow_wakes_blocked_reader():
+    obs = AsyncObserver(0)
+    queue = obs.subscribe(maxsize=1, overflow="close")
+    reader = asyncio.create_task(queue.get())
+
+    # Let the reader block, then wake it with a value and overflow before it resumes.
+    await asyncio.sleep(0)
+    obs.notify(1)
+    obs.notify(2)
+
+    async with asyncio.timeout(1):
+        with pytest.raises(asyncio.QueueShutDown):
+            await reader
+
+    assert obs.dropped == 2
+
+
+@pytest.mark.asyncio
+async def test_async_observer_overflow_join_waits_for_delivered_values():
+    obs = AsyncObserver(0)
+    queue = obs.subscribe(maxsize=2, overflow="close")
+
+    obs.notify(1)
+    assert queue.get_nowait() == 1
+
+    for value in (2, 3, 4):
+        obs.notify(value)
+
+    assert obs.subscriber_count == 0
+    joining = asyncio.create_task(queue.join())
+
+    # The delivered value is still outstanding, while discarded ones are not.
+    await asyncio.sleep(0)
+    assert not joining.done()
+
+    queue.task_done()
+
+    async with asyncio.timeout(1):
+        await joining
+
+
+@pytest.mark.asyncio
+async def test_async_observer_canceled_read_keeps_subscription():
+    obs = AsyncObserver(0)
+
+    with obs.subscription(maxsize=1, overflow="close") as queue:
+        reader = asyncio.create_task(queue.get())
+        await asyncio.sleep(0)
+        reader.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await reader
+
+        assert obs.subscriber_count == 1
+
+        obs.notify(1)
+        assert queue.get_nowait() == 1
+
+
+@pytest.mark.asyncio
+async def test_async_observer_unsubscribe_after_overflow():
+    obs = AsyncObserver(0)
+
+    with obs.subscription(maxsize=1, overflow="close") as queue:
+        obs.notify(1)
+        obs.notify(2)
+
+    assert obs.subscriber_count == 0
+
+    with pytest.raises(asyncio.QueueShutDown):
+        queue.get_nowait()
+
+
+@pytest.mark.asyncio
+async def test_async_observer_close_wakes_blocked_readers():
+    obs = AsyncObserver(0)
+    queues = [obs.subscribe(), obs.subscribe(overflow="close")]
+    readers = [asyncio.create_task(queue.get()) for queue in queues]
+
+    await asyncio.sleep(0)
+    obs.close()
+
+    async with asyncio.timeout(1):
+        for reader in readers:
+            with pytest.raises(asyncio.QueueShutDown):
+                await reader
+
+
+@pytest.mark.asyncio
+async def test_async_observer_close_discards_pending_values():
+    obs = AsyncObserver(0)
+
+    with obs.subscription() as queue:
+        obs.notify(1)
+        obs.notify(2)
+        assert queue.get_nowait() == 1
+
+        obs.close()
+
+        assert obs.subscriber_count == 0
+        assert obs.dropped == 0
+
+        with pytest.raises(asyncio.QueueShutDown):
+            queue.get_nowait()
+
+        # Only the delivered value remains outstanding.
+        joining = asyncio.create_task(queue.join())
+        await asyncio.sleep(0)
+        assert not joining.done()
+
+        queue.task_done()
+
+        async with asyncio.timeout(1):
+            await joining
+
+    # Leaving the subscription after close is safe.
+    obs.unsubscribe(queue)
+    assert obs.subscriber_count == 0
+
+
+@pytest.mark.asyncio
+async def test_async_observer_closed_lifetime():
+    obs = AsyncObserver(0)
+    assert not obs.closed
+
+    obs.subscribe(maxsize=1, overflow="close")
+    obs.notify(1)
+    obs.notify(2)
+
+    # An isolated overflow leaves the observer open.
+    assert obs.subscriber_count == 0
+    assert not obs.closed
+
+    obs.close()
+    assert obs.closed
+
+    obs.close()
+    assert obs.closed
+
+    # The last value stays readable, but the observer cannot be reused.
+    assert obs.value == 2
+
+    with pytest.raises(RuntimeError):
+        obs.subscribe()
+
+    with pytest.raises(RuntimeError):
+        obs.notify(3)
+
+    assert obs.value == 2
+
+
+@pytest.mark.asyncio
+async def test_async_observer_consume_ends_on_close():
+    obs = AsyncObserver(0)
+    seen = []
+
+    async def reader():
+        async for value in obs.consume(initial_value=True):
+            seen.append(value)
+
+            if value == 1:
+                obs.close()
+
+    task = asyncio.create_task(reader())
+    await asyncio.sleep(0)
+    obs.notify(1)
+
+    async with asyncio.timeout(1):
+        await task
+
+    assert seen == [0, 1]
+    assert obs.subscriber_count == 0
+
+
+@pytest.mark.asyncio
+async def test_async_observer_consume_raises_on_overflow():
+    obs = AsyncObserver(0)
+    values = obs.consume(maxsize=1, overflow="close")
+    reading = asyncio.ensure_future(anext(values))
+
+    await asyncio.sleep(0)
+    obs.notify(1)
+    obs.notify(2)
+
+    async with asyncio.timeout(1):
+        with pytest.raises(asyncio.QueueShutDown):
+            await reading
+
+    assert not obs.closed
+    assert obs.subscriber_count == 0
+
+
+@pytest.mark.asyncio
+async def test_async_observer_consume_raises_on_close():
+    obs = AsyncObserver(0)
+    values = obs.consume(initial_value=True, overflow="close")
+
+    async with asyncio.timeout(1):
+        assert await anext(values) == 0
+
+        obs.close()
+
+        with pytest.raises(asyncio.QueueShutDown):
+            await anext(values)
+
+    assert obs.closed
+    assert obs.subscriber_count == 0
+
+
+@pytest.mark.asyncio
+async def test_async_observer_consume_unsubscribes_on_cancellation():
+    obs = AsyncObserver(0)
+    values = obs.consume(initial_value=True)
+
+    async with asyncio.timeout(1):
+        assert await anext(values) == 0
+
+        # Cancellation releases the subscription.
+        with pytest.raises(asyncio.CancelledError):
+            await values.athrow(asyncio.CancelledError())
+
+    assert obs.subscriber_count == 0
+
+
+@pytest.mark.asyncio
 async def test_async_observer_notify_does_not_suspend():
     obs = AsyncObserver(0)
     queue = obs.subscribe()

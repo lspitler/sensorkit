@@ -6,9 +6,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncGenerator, Awaitable, Callable
-from typing import AsyncContextManager, ClassVar, Self, overload
+from typing import AsyncContextManager, ClassVar, Literal, Self, get_args, overload
 
 from sensorkit.common.logging import limited_logger
+
+type OverflowPolicy = Literal["drop_oldest", "close"]
+"""Overflow handling for observer queues."""
 
 
 def scoped_waiter[T](aw: Awaitable[T]) -> AsyncContextManager[asyncio.Future[T]]:
@@ -138,32 +141,53 @@ class AsyncObserver[T]:
 
     Each subscriber receives values notified after it subscribes, in order. With
     `initial_value=True`, it first receives the current value, if one has been set.
-    When a subscriber's queue is full, its oldest pending value is discarded.
+    Each subscriber chooses what happens when its queue is full. By default its oldest
+    pending value is discarded.
+
+    Closing the observer shuts down every subscriber queue and ends notification.
     """
 
     NOT_SET: ClassVar[object] = object()
     DEFAULT_MAXSIZE: ClassVar[int] = 1024
 
     def __init__(self, initial_value: T = NOT_SET):
-        self._observers: set[asyncio.Queue[T]] = set()
+        self._observers: dict[asyncio.Queue[T], OverflowPolicy] = {}
         self._value = initial_value
         self._dropped = 0
+        self._closed = False
 
-    def subscribe(self, *, initial_value: bool = False, maxsize: int = DEFAULT_MAXSIZE):
+    def subscribe(
+        self,
+        *,
+        initial_value: bool = False,
+        maxsize: int = DEFAULT_MAXSIZE,
+        overflow: OverflowPolicy = "drop_oldest",
+    ):
         """Create and return a new observer queue.
 
         Args:
             initial_value: Whether to seed the queue with the current value, if one is set.
             maxsize: Bound on values queued for this subscriber.
+            overflow: What to do when the queue is full. `drop_oldest` discards the oldest
+                pending value. `close` unsubscribes the queue and shuts it down immediately,
+                discarding its pending values.
 
         Raises:
-            ValueError: If `maxsize` is not positive, which would leave the queue unbounded.
+            RuntimeError: If the observer is closed.
+            ValueError: If `maxsize` is not positive, which would leave the queue unbounded,
+                or if `overflow` is not a known policy.
         """
+        if self._closed:
+            raise RuntimeError("Cannot subscribe to a closed observer")
+
         if maxsize < 1:
             raise ValueError(f"maxsize must be positive, got {maxsize}")
 
+        if overflow not in get_args(OverflowPolicy.__value__):
+            raise ValueError(f"unknown overflow policy {overflow!r}")
+
         queue: asyncio.Queue[T] = asyncio.Queue(maxsize)
-        self._observers.add(queue)
+        self._observers[queue] = overflow
 
         if initial_value and self._value is not self.NOT_SET:
             queue.put_nowait(self._value)
@@ -171,14 +195,20 @@ class AsyncObserver[T]:
         return queue
 
     def unsubscribe(self, queue: asyncio.Queue[T]):
-        """Remove an observer queue."""
-        self._observers.discard(queue)
+        """Remove an observer queue, leaving its pending values readable."""
+        self._observers.pop(queue, None)
         queue.shutdown()
 
     @contextlib.contextmanager
-    def subscription(self, *, initial_value: bool = False, maxsize: int = DEFAULT_MAXSIZE):
+    def subscription(
+        self,
+        *,
+        initial_value: bool = False,
+        maxsize: int = DEFAULT_MAXSIZE,
+        overflow: OverflowPolicy = "drop_oldest",
+    ):
         """Context manager that provides a subscriber queue and unsubscribes it on exit."""
-        queue = self.subscribe(initial_value=initial_value, maxsize=maxsize)
+        queue = self.subscribe(initial_value=initial_value, maxsize=maxsize, overflow=overflow)
 
         try:
             yield queue
@@ -188,24 +218,55 @@ class AsyncObserver[T]:
     def notify(self, value: T):
         """Update the current value and notify all observers.
 
-        Delivery never blocks on a subscriber. A subscriber whose queue is full loses its
-        oldest pending value to make room.
+        Delivery never blocks on a subscriber. A subscriber whose queue is full is handled
+        by its overflow policy.
+
+        Raises:
+            RuntimeError: If the observer is closed.
         """
+        if self._closed:
+            raise RuntimeError("Cannot notify a closed observer")
+
         self._value = value
 
-        for queue in self._observers:
+        # Closing an overflowing queue removes its subscription.
+        for queue, overflow in list(self._observers.items()):
             try:
                 queue.put_nowait(value)
             except asyncio.QueueFull:
-                queue.get_nowait()
-                queue.task_done()
-                queue.put_nowait(value)
-                self._dropped += 1
+                match overflow:
+                    case "drop_oldest":
+                        queue.get_nowait()
+                        queue.task_done()
+                        queue.put_nowait(value)
+                        self._dropped += 1
 
-                limited_logger().warning(
-                    f"observer queue full at {queue.maxsize}; dropping the oldest value. "
-                    "A subscriber is not keeping up, or leaked without unsubscribing."
-                )
+                        limited_logger().warning(
+                            f"observer queue full at {queue.maxsize}; dropping the oldest value. "
+                            "A subscriber is not keeping up, or leaked without unsubscribing."
+                        )
+                    case "close":
+                        del self._observers[queue]
+                        self._dropped += queue.qsize() + 1
+                        queue.shutdown(immediate=True)
+
+                        limited_logger().warning(
+                            f"observer queue full at {queue.maxsize}; closing the subscriber. "
+                            "It is not keeping up, or leaked without unsubscribing."
+                        )
+
+    def close(self):
+        """Permanently close the observer.
+
+        Discard pending values and wake subscribers with `asyncio.QueueShutDown`.
+        The current value stays readable. Closing again has no effect.
+        """
+        self._closed = True
+        queues = list(self._observers)
+        self._observers.clear()
+
+        for queue in queues:
+            queue.shutdown(immediate=True)
 
     @property
     def value(self) -> T:
@@ -222,21 +283,40 @@ class AsyncObserver[T]:
 
     @property
     def dropped(self) -> int:
-        """The number of values dropped because a subscriber's queue was full."""
+        """Values lost to overflow, including pending values discarded on overflow closure."""
         return self._dropped
 
-    async def consume(self, *, initial_value: bool = False, maxsize: int = DEFAULT_MAXSIZE):
-        """Yield successive values as an async generator, unsubscribing automatically on exit."""
-        queue = self.subscribe(initial_value=initial_value, maxsize=maxsize)
+    @property
+    def closed(self) -> bool:
+        """Whether the observer has been closed."""
+        return self._closed
+
+    async def consume(
+        self,
+        *,
+        initial_value: bool = False,
+        maxsize: int = DEFAULT_MAXSIZE,
+        overflow: OverflowPolicy = "drop_oldest",
+    ):
+        """Yield successive values as an async generator, unsubscribing automatically on exit.
+
+        By default, iteration ends when the observer closes. With `overflow="close"`,
+        queue shutdown raises `asyncio.QueueShutDown`. The `closed` property reports
+        whether the observer itself has closed.
+        """
+        queue = self.subscribe(initial_value=initial_value, maxsize=maxsize, overflow=overflow)
 
         try:
             while True:
-                yield await queue.get()
-                queue.task_done()
-        except GeneratorExit:
-            queue.task_done()
-        except asyncio.QueueShutDown as e:
-            raise StopAsyncIteration() from e
+                item = await queue.get()
+
+                try:
+                    yield item
+                finally:
+                    queue.task_done()
+        except asyncio.QueueShutDown:
+            if overflow == "close":
+                raise
         finally:
             self.unsubscribe(queue)
 
