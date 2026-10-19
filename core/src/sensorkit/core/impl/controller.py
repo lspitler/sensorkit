@@ -12,6 +12,7 @@ from loguru import logger
 
 from sensorkit.backend.base import Entity
 from sensorkit.backend.request import CallContext
+from sensorkit.common.aio import defer_cancellation
 from sensorkit.core.controller import (
     AbortRequestMessage,
     AbortResponseMessage,
@@ -99,6 +100,34 @@ class ControllerImpl(EntityImpl, ControllerInterface):
             operating_state=ControllerOperatingState(current=InternalControllerState.UNKNOWN),
             execution_state=TaskExecutionState(execution=None),
         )
+
+        await self._recover_interrupted_transition()
+
+    async def _recover_interrupted_transition(self):
+        async with self._state.updating(self) as update:
+            operating = self._state.operating_state
+            current = self._state.execution_state
+
+            # A pending target also identifies an interrupted lifecycle execution.
+            transition = operating.current == InternalControllerState.TRANSITION
+
+            if not transition and operating.target is None:
+                return
+
+            logger.warning(f"Recovering from interrupted transition to {operating.target}")
+            events = []
+
+            if current.executing:
+                events.append(
+                    TaskExecutionState(
+                        finished=TaskFinishInfo(aborted=True),
+                        execution=current.execution,
+                        context=current.context,
+                    )
+                )
+
+            events.append(operating.derive(current=InternalControllerState.UNKNOWN, target=None))
+            await update(*events)
 
     @override
     async def attach_impl(self):
@@ -233,30 +262,30 @@ class ControllerImpl(EntityImpl, ControllerInterface):
 
             >>> ctx = await self.update_context(iteration=5, timestamp=time.time())
         """
-        current = self._state.execution_state
+        async with self._state.updating(self) as update:
+            current = self._state.execution_state
 
-        if not current.executing or current.execution is None:
-            raise RuntimeError("no task executing")
+            if not current.executing or current.execution is None:
+                raise RuntimeError("no task executing")
 
-        ctx = Context(current.context)
+            ctx = Context(current.context)
 
-        for device in self._devices.values():
-            device.subscription.snapshot(into=ctx)
+            for device in self._devices.values():
+                device.subscription.snapshot(into=ctx)
 
-        ctx.set(*args)
+            ctx.set(*args)
 
-        for key, value in kwargs.items():
-            ctx.set_value(key, value)
+            for key, value in kwargs.items():
+                ctx.set_value(key, value)
 
-        await self._state.update(
-            self,
-            TaskExecutionState(
-                executing=current.executing,
-                aborting=current.aborting,
-                execution=current.execution,
-                context=ctx,
-            ),
-        )
+            await update(
+                TaskExecutionState(
+                    executing=current.executing,
+                    aborting=current.aborting,
+                    execution=current.execution,
+                    context=ctx,
+                ),
+            )
 
         return ctx
 
@@ -279,36 +308,39 @@ class ControllerImpl(EntityImpl, ControllerInterface):
         requested: AbortRequestMessage,
         call: CallContext[None, AbortResponseMessage],
     ):
-        # Cannot abort if no task is running.
-        if not self.task_running():
-            call.reject(
-                response=AbortResponseMessage(aborting=False, task_id=None),
-                reason="No task is running",
+        async with self._state.updating(self) as update:
+            aio_task = self._task_asyncio
+            current = self._state.execution_state
+
+            # The request may still be completing after its execution has settled.
+            if aio_task is None or not current.executing:
+                call.reject(
+                    response=AbortResponseMessage(aborting=False, task_id=None),
+                    reason="No task is running",
+                )
+                return
+
+            task_id = current.execution.task_id
+
+            # If given, ensure the task_id matches what is running.
+            if requested.task_id and task_id != requested.task_id:
+                call.reject(
+                    response=AbortResponseMessage(aborting=False, task_id=None),
+                    reason=f"Running task {task_id} does not match",
+                )
+                return
+
+            # Send an accept response and update status indicating we are about to abort.
+            logger.debug(f"aborting running task {task_id}")
+            call.accept(response=AbortResponseMessage(aborting=True, task_id=task_id))
+            await update(
+                TaskExecutionState(
+                    executing=True,
+                    aborting=True,
+                    execution=current.execution,
+                    context=current.context,
+                ),
             )
-            return
-
-        aio_task = self._task_asyncio
-        task_id = self._state.execution_state.execution.task_id
-
-        # If given, ensure the task_id matches what is running.
-        if requested.task_id and task_id != requested.task_id:
-            call.reject(
-                response=AbortResponseMessage(aborting=False, task_id=None),
-                reason=f"Running task {task_id} does not match",
-            )
-            return
-
-        # Send an accept response and update status indicating we are about to abort.
-        logger.debug(f"aborting running task {task_id}")
-        call.accept(response=AbortResponseMessage(aborting=True, task_id=task_id))
-        await self._state.update(
-            self,
-            TaskExecutionState(
-                executing=True,
-                aborting=True,
-                execution=self._state.execution_state.execution
-            ),
-        )
 
         # Abort the asyncio.Task running the SensorKit Task.
         aio_task.cancel("Aborted by remote request")
@@ -449,16 +481,9 @@ class ControllerImpl(EntityImpl, ControllerInterface):
         target = task.target_state()
         arrived = False
 
-        # Emit the execution start event, seeding the executing state's context from the
-        # incoming execution context. This becomes the base layer that `update_context`
-        # merges device snapshots onto and that is ultimately sent to downstream cameras.
-        await self._state.update(
-            self,
-            TaskExecutionState(executing=True, execution=execution, context=execution.context),
-            self._state.operating_state.derive(target=target),
-        )
-
         try:
+            await self._publish_start(execution, target)
+
             # Find the user-supplied task handler callback for this task type.
             handler = self._task_handlers.get(type(task))
             assert handler
@@ -472,23 +497,50 @@ class ControllerImpl(EntityImpl, ControllerInterface):
             finish_info = TaskFinishInfo()
             arrived = True
         finally:
-            # A lifecycle task that did not finish may have left the hardware between states.
-            match target:
-                case None:
-                    current = self._state.operating_state.current
-                case _ if arrived:
-                    current = target
-                case _:
-                    current = InternalControllerState.UNKNOWN
+            # Finish settlement before propagating another cancellation.
+            await defer_cancellation(
+                self._publish_finish(execution, target, finish_info, arrived=arrived)
+            )
 
-            try:
-                await self._state.update(
-                    self,
-                    TaskExecutionState(finished=finish_info, execution=execution),
-                    self._state.operating_state.derive(current=current, target=None),
+    async def _publish_start(
+        self,
+        execution: TaskExecution,
+        target: InternalControllerState | None,
+    ):
+        async with self._state.updating(self) as update:
+            # Execution context is the base for later device snapshots.
+            events = [
+                TaskExecutionState(executing=True, execution=execution, context=execution.context)
+            ]
+
+            if target is not None:
+                events.append(
+                    self._state.operating_state.derive(
+                        current=InternalControllerState.TRANSITION,
+                        target=target,
+                    )
                 )
-            except Exception as e:
-                logger.warning(f"Error logging final task execution state ({type(e).__name__})")
+
+            await update(*events)
+
+    async def _publish_finish(
+        self,
+        execution: TaskExecution,
+        target: InternalControllerState | None,
+        finish_info: TaskFinishInfo,
+        *,
+        arrived: bool,
+    ):
+        async with self._state.updating(self) as update:
+            operating = self._state.operating_state
+            events = [TaskExecutionState(finished=finish_info, execution=execution)]
+
+            # Preserve the prior state if the transition was never applied.
+            if target is not None and operating.current == InternalControllerState.TRANSITION:
+                current = target if arrived else InternalControllerState.UNKNOWN
+                events.append(operating.derive(current=current, target=None))
+
+            await update(*events)
 
     @override
     def task_handler[T: Task](self, task_model: type[T]):
@@ -514,4 +566,14 @@ class ControllerImpl(EntityImpl, ControllerInterface):
 
     @override
     async def set_internal_state(self, state: InternalControllerState):
-        await self._state.update(self, self._state.operating_state.derive(current=state))
+        if state == InternalControllerState.TRANSITION:
+            raise ValueError("A transition requires a lifecycle task")
+
+        async with self._state.updating(self) as update:
+            current = self._state.execution_state
+
+            # A finished execution can leave a transition behind if publication failed.
+            if current.executing and current.execution.task.target_state() is not None:
+                raise ValueError("Cannot report state while a lifecycle task is running")
+
+            await update(self._state.operating_state.derive(current=state, target=None))

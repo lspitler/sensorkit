@@ -4,7 +4,101 @@ import gc
 
 import pytest
 
-from sensorkit.common.aio import AsyncLoop, AsyncObserver, AsyncValueLatch
+from sensorkit.common.aio import AsyncLoop, AsyncObserver, AsyncValueLatch, defer_cancellation
+
+
+async def released_operation(started: asyncio.Event, release: asyncio.Event, error=None):
+    """Wait for release, then return a result or raise the given error."""
+    started.set()
+    await release.wait()
+
+    if error is not None:
+        raise error
+
+    return "done"
+
+
+@pytest.mark.asyncio
+async def test_defer_cancellation_returns_result():
+    async def compute(value: int):
+        return value
+
+    future = asyncio.get_running_loop().create_future()
+    future.set_result(3)
+
+    async with asyncio.timeout(1):
+        assert await defer_cancellation(compute(1)) == 1
+        assert await defer_cancellation(asyncio.create_task(compute(2))) == 2
+        assert await defer_cancellation(future) == 3
+
+
+@pytest.mark.asyncio
+async def test_defer_cancellation_raises_operation_failure():
+    async def fail():
+        raise RuntimeError("operation failed")
+
+    async with asyncio.timeout(1):
+        with pytest.raises(RuntimeError, match="operation failed"):
+            await defer_cancellation(fail())
+
+
+@pytest.mark.asyncio
+async def test_defer_cancellation_waits_through_repeated_cancellation():
+    started = asyncio.Event()
+    release = asyncio.Event()
+    operation = asyncio.create_task(released_operation(started, release))
+    caller = asyncio.create_task(defer_cancellation(operation))
+    await started.wait()
+
+    for _ in range(2):
+        caller.cancel()
+        await asyncio.sleep(0)
+
+    # Neither the operation nor its caller ends before release.
+    assert not operation.done()
+    assert not caller.done()
+
+    release.set()
+
+    async with asyncio.timeout(1):
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+    assert operation.result() == "done"
+
+
+@pytest.mark.asyncio
+async def test_defer_cancellation_prefers_operation_failure():
+    started = asyncio.Event()
+    release = asyncio.Event()
+    error = RuntimeError("operation failed")
+    caller = asyncio.create_task(defer_cancellation(released_operation(started, release, error)))
+    await started.wait()
+
+    caller.cancel()
+    await asyncio.sleep(0)
+    release.set()
+
+    async with asyncio.timeout(1):
+        with pytest.raises(RuntimeError, match="operation failed"):
+            await caller
+
+
+@pytest.mark.asyncio
+async def test_defer_cancellation_propagates_operation_cancellation():
+    started = asyncio.Event()
+    release = asyncio.Event()
+    operation = asyncio.create_task(released_operation(started, release))
+    caller = asyncio.create_task(defer_cancellation(operation))
+    await started.wait()
+
+    operation.cancel()
+
+    async with asyncio.timeout(1):
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+    assert operation.cancelled()
 
 
 @pytest.mark.asyncio

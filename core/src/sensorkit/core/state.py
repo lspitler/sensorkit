@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import copy
 import inspect
 import threading
-from typing import ClassVar, Self, get_type_hints
+from collections.abc import AsyncIterator, Iterable
+from typing import ClassVar, Protocol, Self, get_type_hints
 
 from pydantic import BaseModel
 
@@ -12,6 +15,18 @@ from sensorkit.backend.base import KVError
 from sensorkit.backend.event import Event
 from sensorkit.core.entity import EntityBase, EntityClient
 from sensorkit.core.impl.entity import EntityImpl
+
+
+class StateUpdate[S](Protocol):
+    """Publish state events within an update scope."""
+
+    async def __call__(
+        self,
+        *events: Event,
+        publish_state: bool = True,
+        return_snapshot: bool = False,
+    ) -> S | None:
+        """Apply events and optionally publish or copy the updated state."""
 
 
 class EventSourcedState(BaseModel):
@@ -68,25 +83,60 @@ class EventSourcedState(BaseModel):
 
         Returns a deep copy of the updated state if return_snapshot is True, else None.
         """
+        async with self.updating(entity) as update:
+            return await update(
+                *events, publish_state=publish_state, return_snapshot=return_snapshot
+            )
+
+    @contextlib.asynccontextmanager
+    async def updating(self, entity: EntityImpl) -> AsyncIterator[StateUpdate[Self]]:
+        """Hold the update lock while reading state and publishing derived events.
+
+        Use the yielded updater for writes in this scope.
+        It accepts `update`'s event and publication arguments and raises `RuntimeError`
+        after the scope exits.
+        Within the scope, calling `update` or entering another update scope on this state
+        would deadlock.
+        """
         async with self._update_lock:
-            for event in events:
-                field = self._event_fields.get(type(event))
+            active = True
 
-                if field is None:
-                    raise KeyError(f"No {event.event_model} event field exists")
+            async def update(*events: Event, publish_state=True, return_snapshot=False):
+                if not active:
+                    raise RuntimeError("State update scope has exited")
 
-                setattr(self, field, event)
-                await entity.emit_event(event)
+                return await self._apply(entity, events, publish_state, return_snapshot)
 
-            # Ordering is crucial here: events must be emitted first since they are the source of
-            # truth.
-            if publish_state:
-                await entity.kv_put_model(self)
+            try:
+                yield update
+            finally:
+                active = False
 
-            # Make a snapshot while we hold the lock,
-            snapshot = self.model_copy(deep=True) if return_snapshot else None
+    async def _apply(
+        self,
+        entity: EntityImpl,
+        events: Iterable[Event],
+        publish_state: bool,
+        return_snapshot: bool,
+    ):
+        for event in events:
+            field = self._event_fields.get(type(event))
 
-        return snapshot
+            if field is None:
+                raise KeyError(f"No {event.event_model} event field exists")
+
+            setattr(self, field, event)
+            await entity.emit_event(event)
+
+        # Events are the source of truth and precede the KV snapshot.
+        if publish_state:
+            await entity.kv_put_model(self)
+
+        if not return_snapshot:
+            return None
+
+        # Give the snapshot a fresh lock so runtime waiters are excluded from the copy.
+        return copy.deepcopy(self, {id(self._update_lock): asyncio.Lock()})
 
     @classmethod
     async def event_stream[T: Event](cls, entity: EntityClient, event_type: type[T]):

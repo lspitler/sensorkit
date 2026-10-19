@@ -31,6 +31,8 @@ class InternalControllerState(StrEnum):
     SHUTDOWN = auto()
     ERROR = auto()
     UNKNOWN = auto()
+    TRANSITION = auto()
+    """A lifecycle task is changing the controller's operating state."""
 
 
 class ControllerEnableState(Event):
@@ -413,5 +415,9 @@ class ControllerInterface(EntityInterface):
 
     @abstractmethod
     async def set_internal_state(self, state: InternalControllerState):
-        """Transition the controller to the given internal operating state."""
+        """Report the settled operating state of the controller.
+
+        Raises:
+            ValueError: If TRANSITION is requested or a lifecycle task is running.
+        """
         ...

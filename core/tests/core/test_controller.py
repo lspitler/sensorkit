@@ -2,26 +2,183 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal, override
 
 import pytest
+import pytest_asyncio
 import uuid_utils.compat as uuid
 from pydantic import BaseModel
 
+from sensorkit.backend.base import Backend, BackendError, Subject
 from sensorkit.backend.event import Event
+from sensorkit.backend.fake import FakeBackendImpl
 from sensorkit.backend.request import CallError
 from sensorkit.common.keyword import declare_keyword
+from sensorkit.core.client import SensorKit
 from sensorkit.core.controller import (
+    ControllerClient,
     ControllerDevice,
+    ControllerEnableState,
+    ControllerOperatingState,
     ControllerState,
     InternalControllerState,
     TaskExecutionState,
+    TaskFinishInfo,
 )
 from sensorkit.core.device import DeviceClient
 from sensorkit.core.impl.controller import ControllerImpl
-from sensorkit.core.task import CollectTask, InitTask, ShutdownTask, TaskExecution
+from sensorkit.core.task import (
+    CollectTask,
+    InitTask,
+    ShutdownTask,
+    StandbyTask,
+    TaskExecution,
+)
+
+OPERATE = InternalControllerState.OPERATE
+STANDBY = InternalControllerState.STANDBY
+SHUTDOWN = InternalControllerState.SHUTDOWN
+ERROR = InternalControllerState.ERROR
+UNKNOWN = InternalControllerState.UNKNOWN
+TRANSITION = InternalControllerState.TRANSITION
+
+
+@dataclass
+class PublishFault:
+    """A rule that blocks or fails one matching stream publication."""
+
+    match: Callable[[dict[str, Any]], bool]
+    fail: bool = False
+    reached: asyncio.Event = field(default_factory=asyncio.Event)
+    release: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+class GatedBackendImpl(FakeBackendImpl):
+    """Fake backend with gates and failures for stream publication."""
+
+    def __init__(self):
+        super().__init__()
+        self.faults: list[PublishFault] = []
+
+    def arm(self, match: Callable[[dict[str, Any]], bool], *, fail=False) -> PublishFault:
+        """Block or fail the next matching publication."""
+        fault = PublishFault(match, fail)
+        self.faults.append(fault)
+        return fault
+
+    def take_fault(self, payload: bytes) -> PublishFault | None:
+        """Consume the first fault matching the publication payload."""
+        try:
+            data = json.loads(payload)
+        except ValueError:
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        for fault in self.faults:
+            if fault.match(data):
+                self.faults.remove(fault)
+                return fault
+
+        return None
+
+    @override
+    async def stream_publish(self, target: Subject, payload: bytes):
+        if fault := self.take_fault(payload):
+            fault.reached.set()
+
+            if fault.fail:
+                raise BackendError("injected publication failure")
+
+            await fault.release.wait()
+
+        await super().stream_publish(target, payload)
+
+
+@pytest_asyncio.fixture
+async def gated_backend():
+    return GatedBackendImpl()
+
+
+@pytest_asyncio.fixture
+async def gated_kit(gated_backend):
+    return SensorKit(Backend(impl=gated_backend))
+
+
+def starting_execution(data: dict[str, Any]) -> bool:
+    return data.get("event_model") == "TaskExecutionState" and data.get("executing") is True
+
+
+def finishing_execution(data: dict[str, Any]) -> bool:
+    return data.get("event_model") == "TaskExecutionState" and data.get("finished") is not None
+
+
+def entering_transition(data: dict[str, Any]) -> bool:
+    return (
+        data.get("event_model") == "ControllerOperatingState" and data["current"] == "transition"
+    )
+
+
+def succeeding_call(data: dict[str, Any]) -> bool:
+    return data.get("call_state") == "success"
+
+
+def reporting(state: InternalControllerState) -> Callable[[dict[str, Any]], bool]:
+    def match(data: dict[str, Any]) -> bool:
+        return data.get("event_model") == "ControllerOperatingState" and data["current"] == state
+
+    return match
+
+
+@contextlib.asynccontextmanager
+async def watch_state(client: ControllerClient):
+    """Open a controller snapshot subscription and consume its initial value."""
+    async with contextlib.aclosing(client.kv_monitor_model(ControllerState)) as states:
+        await anext(states)
+        yield states
+
+
+async def collect_until(
+    states: AsyncIterator[ControllerState],
+    predicate: Callable[[ControllerState], bool],
+) -> list[ControllerState]:
+    """Collect snapshots through the first match."""
+    seen = []
+
+    async for state in states:
+        seen.append(state)
+
+        if predicate(state):
+            return seen
+
+    raise AssertionError("state stream ended")
+
+
+def execution_id(state: ControllerState) -> uuid.UUID | None:
+    execution = state.execution_state.execution
+    return execution.task_id if execution else None
+
+
+def is_finished(state: ControllerState, task_id: uuid.UUID) -> bool:
+    return execution_id(state) == task_id and state.execution_state.finished is not None
+
+
+def operating_history(
+    states: list[ControllerState],
+    *task_ids: uuid.UUID,
+) -> list[tuple[uuid.UUID | None, InternalControllerState]]:
+    """Return execution IDs and operating states for the selected tasks."""
+    return [
+        (execution_id(state), state.operating_state.current)
+        for state in states
+        if execution_id(state) in task_ids
+    ]
 
 
 @pytest.mark.asyncio
@@ -202,7 +359,7 @@ async def test_lifecycle_task_reports_arrival_only_on_success(kit, outcome, expe
         await cli.execute_task(InitTask())
 
         exec_call = cli.execute_task(ShutdownTask())
-        await exec_call.invoke()
+        task_id = (await exec_call.invoke()).execution.task_id
         await started.wait()
 
         match outcome:
@@ -220,7 +377,525 @@ async def test_lifecycle_task_reports_arrival_only_on_success(kit, outcome, expe
         state = await cli.kv_get_model(ControllerState)
 
     assert state.operating_state.current == expected
+    assert state.operating_state.previous == TRANSITION
     assert state.operating_state.target is None
+    assert is_finished(state, task_id)
+    assert state.execution_state.finished.aborted == (outcome == "abort")
+    assert bool(state.execution_state.finished.error) == (outcome == "fail")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_type", "target"),
+    [(InitTask, OPERATE), (StandbyTask, STANDBY), (ShutdownTask, SHUTDOWN)],
+    ids=("init", "standby", "shutdown"),
+)
+async def test_lifecycle_task_reports_transition(kit, task_type, target):
+    async with asyncio.timeout(1.0):
+        sc = await kit.register_service("testservice", "0.1.0")
+        controller = await sc.register_controller("mycontroller")
+
+    started = asyncio.Event()
+    can_finish = asyncio.Event()
+
+    @controller.task_handler(task_type)
+    async def run_task(_):
+        started.set()
+        await can_finish.wait()
+
+    async with asyncio.timeout(1.0):
+        cli = kit.controller("mycontroller")
+        exec_call = cli.execute_task(task_type())
+        task_id = (await exec_call.invoke()).execution.task_id
+        await started.wait()
+
+        running = await cli.kv_get_model(ControllerState)
+        can_finish.set()
+        await exec_call
+        settled = await cli.kv_get_model(ControllerState)
+
+    assert running.operating_state.current == TRANSITION
+    assert running.operating_state.target == target
+    assert running.execution_state.executing
+    assert execution_id(running) == task_id
+
+    assert settled.operating_state.current == target
+    assert settled.operating_state.previous == TRANSITION
+    assert settled.operating_state.target is None
+    assert is_finished(settled, task_id)
+
+
+@pytest.mark.asyncio
+async def test_fast_lifecycle_task_reports_transition(kit):
+    async with asyncio.timeout(1.0):
+        sc = await kit.register_service("testservice", "0.1.0")
+        controller = await sc.register_controller("mycontroller")
+
+    @controller.task_handler(InitTask)
+    async def run_init(_: InitTask):
+        pass
+
+    cli = kit.controller("mycontroller")
+
+    async with asyncio.timeout(1.0), watch_state(cli) as states:
+        exec_call = cli.execute_task(InitTask())
+        task_id = (await exec_call.invoke()).execution.task_id
+        await exec_call
+        seen = await collect_until(states, lambda state: is_finished(state, task_id))
+
+    assert operating_history(seen, task_id) == [(task_id, TRANSITION), (task_id, OPERATE)]
+
+
+@pytest.mark.asyncio
+async def test_interrupting_task_settles_prior_transition_first(kit):
+    async with asyncio.timeout(1.0):
+        sc = await kit.register_service("testservice", "0.1.0")
+        controller = await sc.register_controller("mycontroller")
+
+    started = asyncio.Event()
+
+    @controller.task_handler(InitTask)
+    async def run_init(_: InitTask):
+        started.set()
+        await asyncio.Event().wait()
+
+    @controller.task_handler(ShutdownTask)
+    async def run_shutdown(_: ShutdownTask):
+        pass
+
+    cli = kit.controller("mycontroller")
+
+    async with asyncio.timeout(1.0), watch_state(cli) as states:
+        first = cli.execute_task(InitTask())
+        first_id = (await first.invoke()).execution.task_id
+        await started.wait()
+
+        second = cli.execute_task(ShutdownTask(), interrupt=True)
+        second_id = (await second.invoke()).execution.task_id
+        await second
+
+        with pytest.raises(CallError):
+            await first.wait()
+
+        seen = await collect_until(states, lambda state: is_finished(state, second_id))
+
+    assert operating_history(seen, first_id, second_id) == [
+        (first_id, TRANSITION),
+        (first_id, UNKNOWN),
+        (second_id, TRANSITION),
+        (second_id, SHUTDOWN),
+    ]
+
+    interrupted = next(state for state in seen if is_finished(state, first_id))
+    assert interrupted.execution_state.finished.aborted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["succeed", "fail", "abort"])
+async def test_non_lifecycle_task_preserves_reported_state(kit, outcome):
+    async with asyncio.timeout(1.0):
+        sc = await kit.register_service("testservice", "0.1.0")
+        controller = await sc.register_controller("mycontroller")
+
+    started = asyncio.Event()
+    can_finish = asyncio.Event()
+
+    @controller.task_handler(InitTask)
+    async def run_init(_: InitTask):
+        pass
+
+    @controller.task_handler(CollectTask)
+    async def run_collect(_: CollectTask):
+        started.set()
+
+        match outcome:
+            case "succeed":
+                await can_finish.wait()
+            case "fail":
+                await can_finish.wait()
+                raise RuntimeError("camera fault")
+            case "abort":
+                await asyncio.Event().wait()
+
+    async with asyncio.timeout(1.0):
+        cli = kit.controller("mycontroller")
+        await cli.execute_task(InitTask())
+
+        exec_call = cli.execute_task(CollectTask())
+        task_id = (await exec_call.invoke()).execution.task_id
+        await started.wait()
+
+        await controller.set_internal_state(ERROR)
+        can_finish.set()
+
+        match outcome:
+            case "succeed":
+                await exec_call.wait()
+            case "fail":
+                with pytest.raises(CallError):
+                    await exec_call.wait()
+            case "abort":
+                await cli.abort_task()
+
+                with pytest.raises(CallError):
+                    await exec_call.wait()
+
+        state = await cli.kv_get_model(ControllerState)
+
+    assert state.operating_state.current == ERROR
+    assert state.operating_state.previous == OPERATE
+    assert state.operating_state.target is None
+    assert is_finished(state, task_id)
+    assert state.execution_state.finished.aborted == (outcome == "abort")
+
+
+@pytest.mark.asyncio
+async def test_state_report_rejected_during_lifecycle_task(kit):
+    async with asyncio.timeout(1.0):
+        sc = await kit.register_service("testservice", "0.1.0")
+        controller = await sc.register_controller("mycontroller")
+
+    started = asyncio.Event()
+    can_finish = asyncio.Event()
+
+    @controller.task_handler(InitTask)
+    async def run_init(_: InitTask):
+        started.set()
+        await can_finish.wait()
+
+    with pytest.raises(ValueError):
+        await controller.set_internal_state(TRANSITION)
+
+    async with asyncio.timeout(1.0):
+        cli = kit.controller("mycontroller")
+        exec_call = cli.execute_task(InitTask())
+        await exec_call.invoke()
+        await started.wait()
+
+        with pytest.raises(ValueError):
+            await controller.set_internal_state(STANDBY)
+
+        running = await cli.kv_get_model(ControllerState)
+        can_finish.set()
+        await exec_call
+
+        await controller.set_internal_state(STANDBY)
+        reported = await cli.kv_get_model(ControllerState)
+
+    assert running.operating_state.current == TRANSITION
+    assert reported.operating_state.current == STANDBY
+    assert reported.operating_state.previous == OPERATE
+
+
+def seeded_state(
+    operating: ControllerOperatingState,
+    execution_state: TaskExecutionState,
+) -> ControllerState:
+    return ControllerState(
+        enable_state=ControllerEnableState(enabled=True),
+        operating_state=operating,
+        execution_state=execution_state,
+    )
+
+
+def seeded_execution() -> TaskExecution:
+    return TaskExecution(task=ShutdownTask(), task_id=uuid.uuid7(), controller_id="mycontroller")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operating", "executing", "aborting", "finished"),
+    [
+        (ControllerOperatingState(current=TRANSITION, target=SHUTDOWN), True, False, None),
+        (ControllerOperatingState(current=TRANSITION, target=SHUTDOWN), True, True, None),
+        (ControllerOperatingState(current=OPERATE, target=SHUTDOWN), True, False, None),
+        (
+            ControllerOperatingState(current=TRANSITION, target=SHUTDOWN),
+            False,
+            False,
+            TaskFinishInfo(error="lost"),
+        ),
+    ],
+    ids=("executing", "aborting", "legacy_target", "finished"),
+)
+async def test_startup_recovers_interrupted_transition(
+    kit, operating, executing, aborting, finished
+):
+    execution = seeded_execution()
+    cli = kit.controller("mycontroller")
+    observed: list[ControllerState] = []
+
+    await cli.kv_put_model(
+        seeded_state(
+            operating,
+            TaskExecutionState(
+                executing=executing,
+                aborting=aborting,
+                finished=finished,
+                execution=execution,
+            ),
+        )
+    )
+
+    async with asyncio.timeout(1.0):
+        sc = await kit.register_service("testservice", "0.1.0")
+        impl = ControllerImpl.for_service_context(sc, "mycontroller")
+
+        @impl.on_attach
+        async def observe():
+            observed.append(await cli.kv_get_model(ControllerState))
+
+        await sc.register_impl(impl)
+
+    [state] = observed
+    assert state.operating_state.current == UNKNOWN
+    assert state.operating_state.previous == operating.current
+    assert state.operating_state.target is None
+    assert is_finished(state, execution.task_id)
+
+    if finished is None:
+        assert state.execution_state.finished.aborted
+    else:
+        assert state.execution_state.finished == finished
+
+
+@pytest.mark.asyncio
+async def test_startup_keeps_settled_state(kit):
+    cli = kit.controller("mycontroller")
+    seeded = seeded_state(
+        ControllerOperatingState(current=SHUTDOWN, previous=TRANSITION),
+        TaskExecutionState(finished=TaskFinishInfo(), execution=seeded_execution()),
+    )
+
+    await cli.kv_put_model(seeded)
+
+    async with asyncio.timeout(1.0):
+        sc = await kit.register_service("testservice", "0.1.0")
+        await sc.register_controller("mycontroller")
+        state = await cli.kv_get_model(ControllerState)
+
+    assert state.model_dump() == seeded.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_state_report_waits_for_transition_start(gated_kit, gated_backend):
+    async with asyncio.timeout(1.0):
+        sc = await gated_kit.register_service("testservice", "0.1.0")
+        controller = await sc.register_controller("mycontroller")
+
+    started = asyncio.Event()
+    can_finish = asyncio.Event()
+
+    @controller.task_handler(InitTask)
+    async def run_init(_: InitTask):
+        started.set()
+        await can_finish.wait()
+
+    async with asyncio.timeout(1.0):
+        cli = gated_kit.controller("mycontroller")
+
+        # An earlier report holds the update lock while it publishes.
+        fault = gated_backend.arm(reporting(STANDBY))
+        earlier = asyncio.create_task(controller.set_internal_state(STANDBY))
+        await fault.reached.wait()
+
+        # Queue the lifecycle start behind the held report.
+        exec_call = cli.execute_task(InitTask())
+        await exec_call.invoke()
+
+        later = asyncio.create_task(controller.set_internal_state(ERROR))
+        await asyncio.sleep(0)
+        fault.release.set()
+        await earlier
+
+        with pytest.raises(ValueError):
+            await later
+
+        await started.wait()
+        running = await cli.kv_get_model(ControllerState)
+        can_finish.set()
+        await exec_call
+
+    assert running.operating_state.current == TRANSITION
+    assert running.operating_state.target == OPERATE
+
+
+@pytest.mark.asyncio
+async def test_abort_after_settlement_is_rejected(gated_kit, gated_backend):
+    async with asyncio.timeout(1.0):
+        sc = await gated_kit.register_service("testservice", "0.1.0")
+        controller = await sc.register_controller("mycontroller")
+
+    @controller.task_handler(InitTask)
+    async def run_init(_: InitTask):
+        pass
+
+    async with asyncio.timeout(1.0):
+        cli = gated_kit.controller("mycontroller")
+
+        # Holding the success response keeps the settled execution's request in flight.
+        fault = gated_backend.arm(succeeding_call)
+        exec_call = cli.execute_task(InitTask())
+        task_id = (await exec_call.invoke()).execution.task_id
+        await fault.reached.wait()
+
+        with pytest.raises(CallError):
+            await cli.abort_task().invoke()
+
+        fault.release.set()
+        await exec_call
+        state = await cli.kv_get_model(ControllerState)
+
+    assert state.operating_state.current == OPERATE
+    assert is_finished(state, task_id)
+    assert not state.execution_state.aborting
+    assert not state.execution_state.finished.aborted
+
+
+@pytest.mark.asyncio
+async def test_interrupt_during_settlement_completes_it(gated_kit, gated_backend):
+    async with asyncio.timeout(1.0):
+        sc = await gated_kit.register_service("testservice", "0.1.0")
+        controller = await sc.register_controller("mycontroller")
+
+    started = asyncio.Event()
+
+    @controller.task_handler(InitTask)
+    async def run_init(_: InitTask):
+        started.set()
+        await asyncio.Event().wait()
+
+    @controller.task_handler(ShutdownTask)
+    async def run_shutdown(_: ShutdownTask):
+        pass
+
+    cli = gated_kit.controller("mycontroller")
+
+    async with asyncio.timeout(1.0), watch_state(cli) as states:
+        first = cli.execute_task(InitTask())
+        first_id = (await first.invoke()).execution.task_id
+        await started.wait()
+
+        fault = gated_backend.arm(finishing_execution)
+        abort_call = cli.abort_task()
+        await abort_call.invoke()
+        await fault.reached.wait()
+
+        # The interrupt cancels the first execution again while it publishes its final state.
+        second = cli.execute_task(ShutdownTask(), interrupt=True)
+        second_id = (await second.invoke()).execution.task_id
+        fault.release.set()
+        await second
+        await abort_call.wait()
+
+        with pytest.raises(CallError):
+            await first.wait()
+
+        seen = await collect_until(states, lambda state: is_finished(state, second_id))
+
+    assert operating_history(seen, first_id, second_id) == [
+        (first_id, TRANSITION),
+        (first_id, TRANSITION),
+        (first_id, UNKNOWN),
+        (second_id, TRANSITION),
+        (second_id, SHUTDOWN),
+    ]
+
+    interrupted = next(state for state in seen if is_finished(state, first_id))
+    assert interrupted.execution_state.finished.aborted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failing", "expected"),
+    [(starting_execution, OPERATE), (entering_transition, UNKNOWN)],
+    ids=("execution", "transition"),
+)
+async def test_failed_start_publication_skips_handler(gated_kit, gated_backend, failing, expected):
+    async with asyncio.timeout(1.0):
+        sc = await gated_kit.register_service("testservice", "0.1.0")
+        controller = await sc.register_controller("mycontroller")
+
+    ran = asyncio.Event()
+
+    @controller.task_handler(InitTask)
+    async def run_init(_: InitTask):
+        pass
+
+    @controller.task_handler(StandbyTask)
+    async def run_standby(_: StandbyTask):
+        ran.set()
+
+    async with asyncio.timeout(1.0):
+        cli = gated_kit.controller("mycontroller")
+        await cli.execute_task(InitTask())
+
+        gated_backend.arm(failing, fail=True)
+        exec_call = cli.execute_task(StandbyTask())
+        task_id = (await exec_call.invoke()).execution.task_id
+
+        with pytest.raises(CallError):
+            await exec_call.wait()
+
+        state = await cli.kv_get_model(ControllerState)
+
+    assert not ran.is_set()
+    assert state.operating_state.current == expected
+    assert state.operating_state.target is None
+    assert is_finished(state, task_id)
+    assert state.execution_state.finished.error
+
+
+@pytest.mark.asyncio
+async def test_failed_final_publication_fails_request(gated_kit, gated_backend):
+    async with asyncio.timeout(1.0):
+        sc = await gated_kit.register_service("testservice", "0.1.0")
+        controller = await sc.register_controller("mycontroller")
+
+    @controller.task_handler(InitTask)
+    async def run_init(_: InitTask):
+        pass
+
+    async with asyncio.timeout(1.0):
+        cli = gated_kit.controller("mycontroller")
+        gated_backend.arm(finishing_execution, fail=True)
+        exec_call = cli.execute_task(InitTask())
+
+        with pytest.raises(CallError):
+            await exec_call
+
+        stale = await cli.kv_get_model(ControllerState)
+
+        # No running task owns the stale transition, so a report replaces it.
+        await controller.set_internal_state(STANDBY)
+        reported = await cli.kv_get_model(ControllerState)
+
+    assert stale.operating_state.current == TRANSITION
+    assert stale.execution_state.executing
+    assert reported.operating_state.current == STANDBY
+    assert reported.operating_state.target is None
+
+
+@pytest.mark.asyncio
+async def test_failed_startup_recovery_fails_registration(gated_kit, gated_backend):
+    cli = gated_kit.controller("mycontroller")
+    seeded = seeded_state(
+        ControllerOperatingState(current=TRANSITION, target=SHUTDOWN),
+        TaskExecutionState(executing=True, execution=seeded_execution()),
+    )
+
+    await cli.kv_put_model(seeded)
+
+    async with asyncio.timeout(1.0):
+        sc = await gated_kit.register_service("testservice", "0.1.0")
+        gated_backend.arm(finishing_execution, fail=True)
+
+        with pytest.raises(BackendError):
+            await sc.register_controller("mycontroller")
+
+        state = await cli.kv_get_model(ControllerState)
+
+    assert state.model_dump() == seeded.model_dump()
 
 
 @pytest.mark.asyncio

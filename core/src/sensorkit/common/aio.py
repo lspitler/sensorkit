@@ -50,6 +50,39 @@ def cleanup_future(fut: asyncio.Future | asyncio.Task):
         fut.exception()
 
 
+async def defer_cancellation[T](aw: Awaitable[T]) -> T:
+    """Finish an awaitable before propagating caller cancellation.
+
+    Repeated caller cancellation leaves the operation running and waits for it to finish.
+    Operation failures, including cancellation of the operation itself, take precedence
+    over caller cancellation.
+
+    Args:
+        aw: The operation, as a coroutine, task, or future.
+
+    Returns:
+        The operation's result if the caller was not canceled while waiting.
+
+    Raises:
+        asyncio.CancelledError: If the caller or the operation was canceled.
+    """
+    fut = asyncio.ensure_future(aw)
+    cancelled = False
+
+    while not fut.done():
+        try:
+            await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            cancelled = True
+
+    result = fut.result()
+
+    if cancelled:
+        raise asyncio.CancelledError()
+
+    return result
+
+
 @contextlib.asynccontextmanager
 async def _scoped_waiter(aw: Awaitable) -> AsyncGenerator[asyncio.Task]:
     fut = asyncio.ensure_future(aw)
