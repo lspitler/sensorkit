@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
     from sensorkit.backend.event import Event
     from sensorkit.backend.request import RequestBase, RequestHandlerFunc
-    from sensorkit.common.keyword import Keyword
+    from sensorkit.common.keyword import Keyword, KeywordDict
     from sensorkit.core.client import SensorKit
     from sensorkit.data.context import Context
     from sensorkit.data.graph import DataGraph
@@ -136,8 +136,13 @@ class ControllerDelegate(EntityDelegate, ControllerInterface):
         return self.delegate_target.task_running()
 
     @override
-    async def set_internal_state(self, state: InternalControllerState):
-        return await self.delegate_target.set_internal_state(state)
+    async def set_internal_state(
+        self,
+        state: InternalControllerState,
+        *,
+        context: KeywordDict | None = None,
+    ):
+        return await self.delegate_target.set_internal_state(state, context=context)
 
 
 class DeviceDelegate(EntityDelegate, DeviceInterface):

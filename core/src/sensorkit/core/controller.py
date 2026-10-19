@@ -30,7 +30,9 @@ class InternalControllerState(StrEnum):
     STANDBY = auto()
     SHUTDOWN = auto()
     ERROR = auto()
+    """A known failure prevents asserting an achieved lifecycle state."""
     UNKNOWN = auto()
+    """No achieved lifecycle contract is asserted."""
     TRANSITION = auto()
     """A lifecycle task is changing the controller's operating state."""
 
@@ -124,18 +126,52 @@ class TaskExecutionState(Event):
 
 
 class ControllerOperatingState(Event):
-    """Event indicating the Controller operating state has changed."""
+    """Reported operating state and lifecycle input.
+
+    Achieved states require explicit context, including an empty mapping.
+    Missing or null context changes an achieved state to UNKNOWN.
+    """
     current: InternalControllerState
     previous: InternalControllerState | None = None
     target: InternalControllerState | None = None
+    context: KeywordDict = Field(default_factory=KeywordDict)
+    """Lifecycle input for the current or most recent attempt.
+
+    Achieved states assert this contract. Other states retain it for diagnosis.
+    """
 
     NO_CHANGE: ClassVar[object] = object()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_context(cls, data: Any) -> Any:
+        """Normalize lifecycle records with missing or null context."""
+        if not isinstance(data, dict) or data.get("context") is not None:
+            return data
+
+        # Keep missing context detectable during startup normalization.
+        data = {key: value for key, value in data.items() if key != "context"}
+
+        match data.get("current"):
+            case (
+                InternalControllerState.OPERATE
+                | InternalControllerState.STANDBY
+                | InternalControllerState.SHUTDOWN
+            ):
+                return {
+                    **data,
+                    "current": InternalControllerState.UNKNOWN,
+                    "previous": data["current"],
+                }
+
+        return data
 
     def derive(
         self,
         *,
         current: InternalControllerState = NO_CHANGE,
         target: InternalControllerState | None = NO_CHANGE,
+        context: KeywordDict = NO_CHANGE,
     ) -> Self:
         """Return a new ControllerOperatingState based on this one, updating only the specified fields."""
         if current == self.current:
@@ -146,6 +182,7 @@ class ControllerOperatingState(Event):
             current=self.current if current == self.NO_CHANGE else current,
             previous=self.previous if current == self.NO_CHANGE else self.current,
             target=self.target if target == self.NO_CHANGE else target,
+            context=self.context if context is self.NO_CHANGE else context,
         )
 
 
@@ -414,8 +451,18 @@ class ControllerInterface(EntityInterface):
         ...
 
     @abstractmethod
-    async def set_internal_state(self, state: InternalControllerState):
-        """Report the settled operating state of the controller.
+    async def set_internal_state(
+        self,
+        state: InternalControllerState,
+        *,
+        context: KeywordDict | None = None,
+    ):
+        """Report controller state and its lifecycle parameters.
+
+        Args:
+            state: The settled state.
+            context: Lifecycle input. Omission asserts empty input for an achieved state.
+                For UNKNOWN or ERROR, omission preserves the recorded input.
 
         Raises:
             ValueError: If TRANSITION is requested or a lifecycle task is running.

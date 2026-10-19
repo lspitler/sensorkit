@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 from _contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Callable, ClassVar, Collection, Mapping, override
@@ -13,6 +14,7 @@ from loguru import logger
 from sensorkit.backend.base import Entity
 from sensorkit.backend.request import CallContext
 from sensorkit.common.aio import defer_cancellation
+from sensorkit.common.keyword import KeywordDict
 from sensorkit.core.controller import (
     AbortRequestMessage,
     AbortResponseMessage,
@@ -36,7 +38,7 @@ from sensorkit.core.controller import (
 from sensorkit.core.device import DeviceClient
 from sensorkit.core.entity import ControllerDetails, EntityInfo
 from sensorkit.core.impl.entity import EntityImpl
-from sensorkit.core.task import Task, TaskExecution, TaskInfo
+from sensorkit.core.task import RecoverTask, Task, TaskExecution, TaskInfo
 from sensorkit.data.context import Context, ContextSubscription
 
 
@@ -97,36 +99,49 @@ class ControllerImpl(EntityImpl, ControllerInterface):
         self._state = await ControllerState.recover_or_init(
             self,
             enable_state=ControllerEnableState(enabled=True),
-            operating_state=ControllerOperatingState(current=InternalControllerState.UNKNOWN),
+            operating_state=ControllerOperatingState(
+                current=InternalControllerState.UNKNOWN,
+                context=KeywordDict(),
+            ),
             execution_state=TaskExecutionState(execution=None),
         )
 
-        await self._recover_interrupted_transition()
+        await self._normalize_startup_state()
 
-    async def _recover_interrupted_transition(self):
+    async def _normalize_startup_state(self):
         async with self._state.updating(self) as update:
             operating = self._state.operating_state
             current = self._state.execution_state
 
             # A pending target also identifies an interrupted lifecycle execution.
-            transition = operating.current == InternalControllerState.TRANSITION
+            interrupted = (
+                operating.current == InternalControllerState.TRANSITION
+                or operating.target is not None
+            )
 
-            if not transition and operating.target is None:
+            # Persist legacy normalization before accepting work.
+            legacy = "context" not in operating.model_fields_set
+
+            if not interrupted and not legacy:
                 return
 
-            logger.warning(f"Recovering from interrupted transition to {operating.target}")
             events = []
+            settled = operating.NO_CHANGE
 
-            if current.executing:
-                events.append(
-                    TaskExecutionState(
-                        finished=TaskFinishInfo(aborted=True),
-                        execution=current.execution,
-                        context=current.context,
+            if interrupted:
+                logger.warning(f"Recovering from interrupted transition to {operating.target}")
+                settled = InternalControllerState.UNKNOWN
+
+                if current.executing:
+                    events.append(
+                        TaskExecutionState(
+                            finished=TaskFinishInfo(aborted=True),
+                            execution=current.execution,
+                            context=current.context,
+                        )
                     )
-                )
 
-            events.append(operating.derive(current=InternalControllerState.UNKNOWN, target=None))
+            events.append(operating.derive(current=settled, target=None))
             await update(*events)
 
     @override
@@ -372,6 +387,9 @@ class ControllerImpl(EntityImpl, ControllerInterface):
             expiry_time=msg.expiry_time,
         )
 
+        # Snapshot lifecycle input before adding execution metadata.
+        lifecycle_context = copy.deepcopy(execution.context)
+
         # Inject information about this task execution into the task context.
         execution.context.set(
             TaskInfo(
@@ -420,7 +438,7 @@ class ControllerImpl(EntityImpl, ControllerInterface):
 
             with self.enter_context():
                 logger.info(f"Executing {task.task_type} task")
-                aio_task = asyncio.create_task(self._execute_task(execution))
+                aio_task = asyncio.create_task(self._execute_task(execution, lifecycle_context))
 
             self._task_asyncio = aio_task
 
@@ -472,17 +490,18 @@ class ControllerImpl(EntityImpl, ControllerInterface):
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await aio_task
 
-    async def _execute_task(self, execution: TaskExecution):
+    async def _execute_task(self, execution: TaskExecution, lifecycle_context: KeywordDict):
         # Associate the envelope with the task so the handler can reach it via `task.execution`.
         task = execution.task
         task.associate_execution(execution)
         logger.debug(f"execution begun {execution=}")
         finish_info = TaskFinishInfo(aborted=True)
-        target = task.target_state()
-        arrived = False
+        outcome = InternalControllerState.UNKNOWN
+        started = False
 
         try:
-            await self._publish_start(execution, target)
+            await self._publish_start(execution, lifecycle_context)
+            started = True
 
             # Find the user-supplied task handler callback for this task type.
             handler = self._task_handlers.get(type(task))
@@ -491,54 +510,76 @@ class ControllerImpl(EntityImpl, ControllerInterface):
             # Run the task handler.
             await handler(task)
         except Exception as e:
-            finish_info = TaskFinishInfo(error=str(e))
+            finish_info = TaskFinishInfo(error=str(e) or type(e).__name__)
+            outcome = InternalControllerState.ERROR
             raise
         else:
             finish_info = TaskFinishInfo()
-            arrived = True
+            outcome = task.target_state()
         finally:
             # Finish settlement before propagating another cancellation.
             await defer_cancellation(
-                self._publish_finish(execution, target, finish_info, arrived=arrived)
+                self._publish_finish(execution, finish_info, outcome, started=started)
             )
 
-    async def _publish_start(
-        self,
-        execution: TaskExecution,
-        target: InternalControllerState | None,
-    ):
+    async def _publish_start(self, execution: TaskExecution, lifecycle_context: KeywordDict):
+        task = execution.task
+
         async with self._state.updating(self) as update:
+            operating = self._state.operating_state
+
             # Execution context is the base for later device snapshots.
             events = [
                 TaskExecutionState(executing=True, execution=execution, context=execution.context)
             ]
 
-            if target is not None:
-                events.append(
-                    self._state.operating_state.derive(
-                        current=InternalControllerState.TRANSITION,
-                        target=target,
+            match task:
+                # Recovery invalidates the achieved state before hardware work.
+                case RecoverTask():
+                    events.append(
+                        operating.derive(current=InternalControllerState.UNKNOWN, target=None)
                     )
-                )
+                case _ if (target := task.target_state()) is not None:
+                    events.append(
+                        operating.derive(
+                            current=InternalControllerState.TRANSITION,
+                            target=target,
+                            context=lifecycle_context,
+                        )
+                    )
 
             await update(*events)
 
     async def _publish_finish(
         self,
         execution: TaskExecution,
-        target: InternalControllerState | None,
         finish_info: TaskFinishInfo,
+        outcome: InternalControllerState | None,
         *,
-        arrived: bool,
+        started: bool,
     ):
+        task = execution.task
+
         async with self._state.updating(self) as update:
             operating = self._state.operating_state
             events = [TaskExecutionState(finished=finish_info, execution=execution)]
 
-            # Preserve the prior state if the transition was never applied.
-            if target is not None and operating.current == InternalControllerState.TRANSITION:
-                current = target if arrived else InternalControllerState.UNKNOWN
-                events.append(operating.derive(current=current, target=None))
+            match task:
+                # Republish retained state when recovery start fails.
+                case RecoverTask() if not started:
+                    events.append(operating.derive())
+
+                # Preserve state reported by a successful recovery handler.
+                case RecoverTask():
+                    if outcome is not None:
+                        events.append(operating.derive(current=outcome))
+
+                # Preserve the prior state if the transition was never applied.
+                case _ if (
+                    task.target_state() is not None
+                    and operating.current == InternalControllerState.TRANSITION
+                ):
+                    events.append(operating.derive(current=outcome, target=None))
 
             await update(*events)
 
@@ -565,9 +606,23 @@ class ControllerImpl(EntityImpl, ControllerInterface):
         )
 
     @override
-    async def set_internal_state(self, state: InternalControllerState):
+    async def set_internal_state(
+        self,
+        state: InternalControllerState,
+        *,
+        context: KeywordDict | None = None,
+    ):
         if state == InternalControllerState.TRANSITION:
             raise ValueError("A transition requires a lifecycle task")
+
+        match state, context:
+            # Retain lifecycle input when reporting state loss.
+            case InternalControllerState.UNKNOWN | InternalControllerState.ERROR, None:
+                recorded = ControllerOperatingState.NO_CHANGE
+            case _, None:
+                recorded = KeywordDict()
+            case _:
+                recorded = copy.deepcopy(context)
 
         async with self._state.updating(self) as update:
             current = self._state.execution_state
@@ -576,4 +631,6 @@ class ControllerImpl(EntityImpl, ControllerInterface):
             if current.executing and current.execution.task.target_state() is not None:
                 raise ValueError("Cannot report state while a lifecycle task is running")
 
-            await update(self._state.operating_state.derive(current=state, target=None))
+            await update(
+                self._state.operating_state.derive(current=state, target=None, context=recorded)
+            )
