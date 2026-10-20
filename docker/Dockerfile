@@ -63,6 +63,11 @@ RUN useradd --create-home --uid 1000 sensorkit \
     && mkdir -p /opt/sk/data \
     && chown sensorkit:sensorkit /opt/sk/data
 
+# astro-burr (the `burr` extra) creates its caches and downloads ephemerides
+# inside its own package directory on import.
+RUN burr="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/burr/resources" \
+    && if [ -d "$burr" ]; then chown -R sensorkit:sensorkit "$burr"; fi
+
 USER sensorkit
 WORKDIR /home/sensorkit
 
