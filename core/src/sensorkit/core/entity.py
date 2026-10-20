@@ -116,14 +116,35 @@ class EntityBase:
         entry = await self._kv.get(model_type.__name__)
         return model_type.model_validate_json(entry.value)
 
-    async def kv_monitor_model[M: BaseModel](self, model_type: type[M]):
-        """Monitor changes to a model in the KV store by its class name."""
+    async def kv_monitor_model[M: BaseModel](self, model_type: type[M], *, strict: bool = False):
+        """Monitor changes to a model in the KV store by its class name.
+
+        Yields the current model, if any, then each update. Deletions are skipped.
+        Closing the generator releases its subscription.
+
+        Args:
+            model_type: The model stored under its class name.
+            strict: Whether invalid entries raise rather than being skipped.
+
+        Raises:
+            ValidationError: If `strict` is set and an entry is invalid.
+        """
         stream = await self._kv.monitor(model_type.__name__)
 
-        async for entry in stream:
-            if not entry.deleted():
-                with contextlib.suppress(ValidationError):
-                    yield model_type.model_validate_json(entry.value)
+        async with contextlib.aclosing(stream):
+            async for entry in stream:
+                if entry.deleted():
+                    continue
+
+                try:
+                    model = model_type.model_validate_json(entry.value)
+                except ValidationError:
+                    if strict:
+                        raise
+
+                    continue
+
+                yield model
 
 
 class EntityClient(EntityBase):

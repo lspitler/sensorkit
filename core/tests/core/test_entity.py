@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -441,3 +442,66 @@ def test_entity_info_reads_historical_records(data, details):
 
     assert type(info.details) is type(details)
     assert info.details == details
+
+
+class Gauge(BaseModel):
+    """Model monitored from the KV store."""
+
+    level: int
+
+
+INVALID_GAUGES = [b"not json", b'{"level": "high"}']
+
+
+def gauge(level: int) -> bytes:
+    return Gauge(level=level).model_dump_json().encode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", INVALID_GAUGES)
+async def test_kv_monitor_model_skips_invalid_entries(kit, payload):
+    client = kit.entity("gauge")
+    key_value = kit.backend.key_value(client.entity)
+    await key_value.create(key="Gauge", value=gauge(1))
+
+    async with contextlib.aclosing(client.kv_monitor_model(Gauge)) as gauges:
+        async with asyncio.timeout(1.0):
+            assert await anext(gauges) == Gauge(level=1)
+
+            await key_value.update(key="Gauge", value=payload)
+            await key_value.update(key="Gauge", value=gauge(2))
+
+            assert await anext(gauges) == Gauge(level=2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", INVALID_GAUGES)
+async def test_kv_monitor_model_strict_raises_invalid_entries(kit, payload):
+    client = kit.entity("gauge")
+    key_value = kit.backend.key_value(client.entity)
+    await key_value.create(key="Gauge", value=gauge(1))
+
+    async with contextlib.aclosing(client.kv_monitor_model(Gauge, strict=True)) as gauges:
+        async with asyncio.timeout(1.0):
+            assert await anext(gauges) == Gauge(level=1)
+
+            await key_value.update(key="Gauge", value=payload)
+
+            with pytest.raises(ValidationError):
+                await anext(gauges)
+
+
+@pytest.mark.asyncio
+async def test_kv_monitor_model_strict_skips_deletion(kit):
+    client = kit.entity("gauge")
+    key_value = kit.backend.key_value(client.entity)
+    await key_value.create(key="Gauge", value=gauge(1))
+
+    async with contextlib.aclosing(client.kv_monitor_model(Gauge, strict=True)) as gauges:
+        async with asyncio.timeout(1.0):
+            assert await anext(gauges) == Gauge(level=1)
+
+            await key_value.delete("Gauge")
+            await key_value.update(key="Gauge", value=gauge(2))
+
+            assert await anext(gauges) == Gauge(level=2)

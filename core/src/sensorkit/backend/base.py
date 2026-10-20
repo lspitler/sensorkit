@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import traceback
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -261,13 +262,17 @@ class KeyValueContext(BaseContext):
         return key_value_monitor()
 
     async def monitor(self, key: str):
-        """Return an async generator that yields KVEntry objects for changes to the named key."""
+        """Return an async generator that yields KVEntry objects for changes to the named key.
+
+        After iteration begins, closing the generator releases the backend subscription.
+        """
         monitor = await self.impl.kv_monitor(self.entity.subject(key))
 
         async def key_value_monitor():
-            async for batch in monitor:
-                for entry in batch:
-                    yield entry
+            async with contextlib.aclosing(monitor):
+                async for batch in monitor:
+                    for entry in batch:
+                        yield entry
 
         return key_value_monitor()
 
@@ -415,8 +420,12 @@ class BackendImpl(ABC):
         """Consume a stream subject."""
 
     @abstractmethod
-    async def kv_monitor(self, target: Subject) -> AsyncIterator[list[KVEntry]]:
-        """Subscribe to KV modifications for the given entity."""
+    async def kv_monitor(self, target: Subject) -> AsyncGenerator[list[KVEntry]]:
+        """Subscribe to KV modifications for the given entity.
+
+        The first batch holds the current entries.
+        After iteration begins, closing the generator releases the subscription.
+        """
 
     @abstractmethod
     async def kv_get(self, target: Subject) -> KVEntry:

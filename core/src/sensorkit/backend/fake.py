@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 import bisect
-from collections.abc import AsyncIterator, Iterable, MutableMapping
+from collections.abc import AsyncGenerator, AsyncIterator, Iterable, MutableMapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import override
@@ -283,31 +283,39 @@ class FakeBackendImpl(BackendImpl):
         return _stream_consume()
 
     @override
-    async def kv_monitor(self, target: Subject) -> AsyncIterator[list[KVEntry]]:
+    async def kv_monitor(self, target: Subject) -> AsyncGenerator[list[KVEntry]]:
         match target.prop:
             case SpecialProperty.ALL_PROPERTIES:
                 elem = self._kv.element(target.path)
-                subscription = elem.subscribe_children()
+                subscribers = elem.shallow_wildcard
                 history = [
                     self._kv.element(key).history[-1] for key in self._kv.children_of(target.path)
                 ]
             case SpecialProperty.ALL_DESCENDANTS:
                 elem = self._kv.element(target.path)
-                subscription = elem.subscribe_descendants()
+                subscribers = elem.deep_wildcard
                 history = [
                     self._kv.element(key).history[-1]
                     for key in self._kv.descendants_of(target.path)
                 ]
             case _:
                 elem = self._kv.element(target.full_path())
-                subscription = elem.subscribe()
+                subscribers = elem.direct
                 history = [elem.history[-1]] if elem.history else []
 
-        async def _kv_monitor():
-            yield history
+        # Own the queue so closing at the initial batch also unsubscribes.
+        queue: asyncio.Queue[tuple[tuple[str, ...], KVEntry]] = asyncio.Queue()
+        subscribers.add(queue)
 
-            async for _, entry in subscription:
-                yield [entry]
+        async def _kv_monitor():
+            try:
+                yield history
+
+                while True:
+                    _, entry = await queue.get()
+                    yield [entry]
+            finally:
+                subscribers.discard(queue)
 
         return _kv_monitor()
 
