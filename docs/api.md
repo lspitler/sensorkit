@@ -99,9 +99,15 @@ Handler dispatch is by parameter type annotation:
 async def go_home(self, cmd: Home): ...          # handles Home commands
 
 @sk.task_handler
-async def do_collect(self, task: StandardCollectTask): ...
+async def do_init(self, task: sk.InitTask): ...
+
+@sk.task_handler
+async def do_collect(self, execution: sk.TaskExecution[StandardCollectTask]): ...
 ```
 
+A task handler receives either the task or its execution envelope, which adds the task ID and context.
+`sk.task_handler` selects the input from the parameter annotation.
+`ControllerImpl.add_task_handler` registers the callback explicitly through `task_callback` or `execution_callback`.
 One handler per command/task type per entity; only one task factory per program.
 
 ## Context accessors
@@ -135,17 +141,27 @@ class Task(RegistryBaseModel):
     task_type: str          # Literal discriminator set by each subclass
 ```
 
-The base of the task system, and the user-extensible part: subclass it, set a `task_type` literal, add your fields, and it registers itself for dispatch and serialization. Execution-envelope data (IDs, context, expiry) lives on a separate `TaskExecution` minted by the controller at submission time; inside a task handler it's available as `task.execution`.
+`Task` defines the work to perform.
+Subclasses set a `task_type` literal and add domain-specific fields.
+They register automatically for dispatch and serialization.
+The controller mints a separate `TaskExecution` with identity, context, and expiry when a task is submitted.
+A declared handler annotated with `T` receives the task.
+A declared handler annotated with `TaskExecution[T]` receives the envelope and accesses its task through `.task`.
 
 - `submit(*, context=None, expiry_time=None) -> TaskSubmission` — bundle execution parameters, for use in task factories.
 - `default_expiry() -> datetime | timedelta` — deadline used when no explicit expiry is supplied (default 300 s from dispatch); override for domain-specific deadlines.
 - `target_state()` — for lifecycle tasks, the controller state this task drives toward.
 
-**Built-in lifecycle tasks:** `InitTask`, `StandbyTask`, `ShutdownTask`, `RecoverTask`, plus the `CollectTask` and `CalibrateTask` bases. `StandardCollectTask` (in `sensorkit.std.collect`) is the fully-featured observation task — see [Observing programs](programs.md#standardcollecttask).
+Built-in tasks include `InitTask`, `StandbyTask`, `ShutdownTask`, `RecoverTask`, `CollectTask`, and `CalibrateTask`.
+The standard observation task is `StandardCollectTask` in `sensorkit.std.collect`.
+See [Observing programs](programs.md#standardcollecttask).
 
 ### `TaskSubmission`, `TaskExecution`, `TaskInfo`
 
-`TaskSubmission` pairs a task with optional context and expiry. `TaskExecution` is the controller-minted envelope (`task_id`, `controller_id`, context, expiry) that tracks a dispatched task; awaiting it yields the execution result. `TaskInfo` is the keyword snapshot of task identity published into data-pipeline context (e.g. for FITS `TASKID` headers).
+`TaskSubmission` pairs a task with optional context and expiry.
+`TaskExecution[T]` carries the controller-minted identity, execution parameters, and a task of type `T`.
+Executions returned by `ControllerClient.start_task` can be awaited for the final result.
+`TaskInfo` records task identity in data-pipeline context.
 
 ---
 

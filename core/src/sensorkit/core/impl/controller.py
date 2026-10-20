@@ -5,8 +5,10 @@ import asyncio
 import contextlib
 import copy
 from _contextvars import ContextVar
+from collections.abc import Coroutine, Iterator
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Callable, ClassVar, Collection, Mapping, override
+from typing import Any, Callable, ClassVar, Collection, Mapping, override
 
 import uuid_utils.compat as uuid
 from loguru import logger
@@ -26,6 +28,7 @@ from sensorkit.core.controller import (
     ControllerState,
     ExecuteRequestMessage,
     ExecuteResponseMessage,
+    ExecutionHandlerCallback,
     InternalControllerState,
     TaskExecutionResult,
     TaskExecutionState,
@@ -66,6 +69,155 @@ class ControllerDeviceMap(Mapping[str, ControllerDevice]):
         return iter(self._dict)
 
 
+@dataclass(eq=False)
+class TaskRun:
+    """Own a task's runner and execution outcome."""
+
+    execution: TaskExecution
+    context: KeywordDict
+    """The task's input context, captured before execution metadata is added."""
+
+    entered: bool = field(default=False, init=False)
+    cancel_requested: bool = field(default=False, init=False)
+    started: bool = field(default=False, init=False)
+    """Whether the start of this execution was published."""
+
+    finish_info: TaskFinishInfo = field(
+        default_factory=lambda: TaskFinishInfo(aborted=True),
+        init=False,
+    )
+    outcome: InternalControllerState | None = field(
+        default=InternalControllerState.UNKNOWN,
+        init=False,
+    )
+    start_time: datetime | None = field(default=None, init=False)
+
+    _handler: ExecutionHandlerCallback[Any] | None = field(default=None, init=False)
+    _runner: asyncio.Task[TaskExecutionResult] | None = field(default=None, init=False)
+
+    @classmethod
+    def create(
+        cls,
+        controller_id: str,
+        task: Task,
+        *,
+        context: KeywordDict | None,
+        expiry_time: datetime | None,
+    ) -> TaskRun:
+        """Mint execution metadata without scheduling a runner."""
+        execution = TaskExecution(
+            task=task,
+            task_id=uuid.uuid7(),
+            controller_id=controller_id,
+            context=context,
+            expiry_time=expiry_time,
+        )
+        context = copy.deepcopy(execution.context)
+
+        # Add task identity to the working context.
+        execution.context.set(
+            TaskInfo(task=task, task_id=execution.task_id, controller_id=controller_id)
+        )
+
+        return cls(execution, context)
+
+    @property
+    def handler(self) -> ExecutionHandlerCallback[Any]:
+        assert self._handler is not None, "execution is not attached"
+        return self._handler
+
+    @property
+    def runner(self) -> asyncio.Task[TaskExecutionResult]:
+        assert self._runner is not None, "execution is not attached"
+        return self._runner
+
+    def attach(
+        self,
+        handler: ExecutionHandlerCallback[Any],
+        run: Coroutine[Any, Any, TaskExecutionResult],
+    ):
+        """Bind the handler and schedule the runner of an admitted execution.
+
+        Raises:
+            RuntimeError: If the execution is already attached.
+        """
+        if self._runner is not None:
+            raise RuntimeError("execution is already attached")
+
+        self._handler = handler
+        self._runner = asyncio.create_task(run)
+
+    def done(self) -> bool:
+        return self.runner.done()
+
+    def cancel(self, msg: str | None = None):
+        """Request cancellation once."""
+        if self.cancel_requested:
+            return
+
+        self.cancel_requested = True
+
+        # Canceling before the first step would skip the runner's cleanup.
+        if self.entered and not self.runner.done():
+            self.runner.cancel(msg)
+
+    async def join(self):
+        """Join the runner, propagating errors other than execution cancellation."""
+        await asyncio.wait((self.runner,))
+
+        if not self.runner.cancelled() and (error := self.runner.exception()):
+            raise error
+
+    async def wait(self):
+        """Join the runner without propagating its outcome.
+
+        Caller cancellation waits for completion, then propagates.
+        """
+        try:
+            await defer_cancellation(asyncio.wait((self.runner,)))
+        finally:
+            # Observe failures before propagating caller cancellation.
+            if self.runner.done() and not self.runner.cancelled():
+                self.runner.exception()
+
+    @contextlib.contextmanager
+    def execute(self) -> Iterator[TaskExecution]:
+        """Time execution and record success, failure, or cancellation.
+
+        Raises:
+            asyncio.CancelledError: If cancellation was requested before execution.
+        """
+        if self.cancel_requested:
+            raise asyncio.CancelledError()
+
+        self.start_time = datetime.now(UTC)
+
+        try:
+            yield self.execution
+        except Exception as e:
+            self.finish_info = TaskFinishInfo(error=str(e) or type(e).__name__)
+            self.outcome = InternalControllerState.ERROR
+            raise
+        else:
+            self.finish_info = TaskFinishInfo()
+            self.outcome = self.execution.task.target_state()
+
+    def result(self) -> TaskExecutionResult:
+        """Build a successful result with the current time as its end."""
+        assert self.start_time is not None, "execution has not started"
+
+        return TaskExecutionResult(
+            task_id=self.execution.task_id,
+            start_time=self.start_time,
+            end_time=datetime.now(UTC),
+        )
+
+
+def _receive_task[T: Task](callback: TaskHandlerCallback[T]) -> ExecutionHandlerCallback[T]:
+    """Pass the envelope's task to the callback."""
+    return lambda execution: callback(execution.task)
+
+
 class ControllerImpl(EntityImpl, ControllerInterface):
     """Helper for implementing server-side functionality of a Controller."""
 
@@ -76,13 +228,13 @@ class ControllerImpl(EntityImpl, ControllerInterface):
 
         self._enable_hooks: list[Callable[[], None]] = []
         self._disable_hooks: list[Callable[[], None]] = []
-        self._task_handlers: dict[type[Task], TaskHandlerCallback] = {}
-        self._task_asyncio: asyncio.Task | None = None
+        self._task_handlers: dict[type[Task], ExecutionHandlerCallback[Any]] = {}
+        self._execution: TaskRun | None = None
         self._devices = ControllerDeviceMap()
 
     @override
     def task_running(self):
-        return bool(self._task_asyncio)
+        return self._execution is not None and not self._execution.done()
 
     @override
     def on_enable(self, func: Callable[[], None]):
@@ -324,20 +476,20 @@ class ControllerImpl(EntityImpl, ControllerInterface):
         call: CallContext[None, AbortResponseMessage],
     ):
         async with self._state.updating(self) as update:
-            aio_task = self._task_asyncio
+            target = self._execution if self.task_running() else None
             current = self._state.execution_state
 
-            # The request may still be completing after its execution has settled.
-            if aio_task is None or not current.executing:
+            # A finished runner may still be completing its request.
+            if target is None:
                 call.reject(
                     response=AbortResponseMessage(aborting=False, task_id=None),
                     reason="No task is running",
                 )
                 return
 
-            task_id = current.execution.task_id
+            task_id = target.execution.task_id
 
-            # If given, ensure the task_id matches what is running.
+            # If given, ensure the task_id matches the latest accepted execution.
             if requested.task_id and task_id != requested.task_id:
                 call.reject(
                     response=AbortResponseMessage(aborting=False, task_id=None),
@@ -345,30 +497,73 @@ class ControllerImpl(EntityImpl, ControllerInterface):
                 )
                 return
 
-            # Send an accept response and update status indicating we are about to abort.
             logger.debug(f"aborting running task {task_id}")
             call.accept(response=AbortResponseMessage(aborting=True, task_id=task_id))
-            await update(
-                TaskExecutionState(
-                    executing=True,
-                    aborting=True,
-                    execution=current.execution,
-                    context=current.context,
-                ),
-            )
 
-        # Abort the asyncio.Task running the SensorKit Task.
-        aio_task.cancel("Aborted by remote request")
+            # Pending work leaves its predecessor's published execution alone.
+            if current.executing and current.execution.task_id == task_id:
+                await update(
+                    TaskExecutionState(
+                        executing=True,
+                        aborting=True,
+                        execution=current.execution,
+                        context=current.context,
+                    ),
+                )
 
-        # Wait for the task to die.
+            target.cancel("Aborted by remote request")
+
+        # Wait for the execution and its predecessors to end.
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            await call.progress_from_task(aio_task, cadence=5, ttl=10)
+            await call.progress_from_task(target.runner, cadence=5, ttl=10)
 
-        if aio_task.done():
+        if target.done():
             # Success.
             await call.succeed(result=None)
         else:
             await call.fail()
+
+    async def _admit(
+        self,
+        msg: ExecuteRequestMessage,
+        call: CallContext[TaskExecutionResult, ExecuteResponseMessage],
+    ) -> TaskRun | None:
+        task = msg.task
+
+        async with self._state.updating(self):
+            predecessor = self._execution if self.task_running() else None
+            running = TaskRun.create(
+                str(self.entity),
+                task,
+                context=msg.context,
+                expiry_time=msg.expiry_time,
+            )
+
+            response = ExecuteResponseMessage(execution=running.execution)
+            handler = self._task_handlers.get(type(task))
+
+            match self._state.enable_state.enabled, msg.interrupt or predecessor is None, handler:
+                case False, _, _:
+                    reason = "Controller is disabled"
+                case _, False, _:
+                    reason = "Task already in progress"
+                case _, _, None:
+                    reason = f"No handler registered for {task.task_type}"
+                case _, _, handler:
+                    if predecessor:
+                        logger.info(f"Interrupting {predecessor.execution.task.task_type} task")
+
+                    # Ownership is installed before acceptance becomes visible.
+                    running.attach(handler, self._run_execution(running, predecessor))
+                    self._execution = running
+                    call.accept(response=response)
+
+                    return running
+
+        logger.warning(f"Rejecting {task.task_type} task: {reason}")
+        call.reject(response=response, reason=reason)
+
+        return None
 
     async def _execute_request(
         self,
@@ -376,79 +571,15 @@ class ControllerImpl(EntityImpl, ControllerInterface):
         call: CallContext[TaskExecutionResult, ExecuteResponseMessage],
     ):
         task = msg.task
+        running = await self._admit(msg, call)
 
-        # Mint the execution envelope: the controller owns identity (task_id, controller_id) and
-        # records the client-supplied execution parameters (context, end_time).
-        execution = TaskExecution(
-            task=task,
-            task_id=uuid.uuid7(),
-            controller_id=str(self.entity),
-            context=msg.context,
-            expiry_time=msg.expiry_time,
-        )
-
-        # Snapshot lifecycle input before adding execution metadata.
-        lifecycle_context = copy.deepcopy(execution.context)
-
-        # Inject information about this task execution into the task context.
-        execution.context.set(
-            TaskInfo(
-                task=task,
-                task_id=execution.task_id,
-                controller_id=execution.controller_id,
-            )
-        )
-
-        # Send the initial response.
-        response = ExecuteResponseMessage(execution=execution)
-
-        if not self._state.enable_state.enabled:
-            logger.warning(f"Rejecting {task.task_type} task: Controller is disabled")
-            call.reject(response=response, reason="Controller is disabled")
+        if running is None:
             return
 
-        if not msg.interrupt and self.task_running():
-            logger.warning(f"Rejecting {task.task_type} task: Task already in progress")
-            call.reject(response=response, reason="Task already in progress")
-            return
-
-        if type(task) not in self._task_handlers:
-            logger.warning(f"Rejecting {task.task_type} task: No handler registered")
-            call.reject(response=response, reason=f"No handler registered for {task.task_type}")
-            return
-
-        call.accept(response=response)
-        aio_task: asyncio.Task | None = None
+        execution = running.execution
 
         try:
-            # Interrupt the current task, if there is one.
-            if self._task_asyncio:
-                logger.info(f"Interrupting {self._state.execution_state.execution.task.task_type} task")
-                self._task_asyncio.cancel("Interrupted")
-
-                with contextlib.suppress(asyncio.CancelledError):
-                    await call.progress_from_task(
-                        self._task_asyncio,
-                        cadence=6.0,
-                        ttl=10.0,
-                    )
-
-            # Execute the task.
-            start_time = datetime.now(UTC)
-
-            with self.enter_context():
-                logger.info(f"Executing {task.task_type} task")
-                aio_task = asyncio.create_task(self._execute_task(execution, lifecycle_context))
-
-            self._task_asyncio = aio_task
-
-            await call.progress_from_task(
-                self._task_asyncio,
-                cadence=6.0,
-                ttl=10.0,
-            )
-
-            end_time = datetime.now(UTC)
+            await call.progress_from_task(running.runner, cadence=6.0, ttl=10.0)
         except asyncio.CancelledError:
             with self.enter_context():
                 logger.warning(f"Execution of {task.task_type} task cancelled")
@@ -472,57 +603,52 @@ class ControllerImpl(EntityImpl, ControllerInterface):
             with self.enter_context():
                 logger.info(f"Finished {task.task_type} task")
 
-            await call.succeed(
-                result=TaskExecutionResult(
-                    task_id=execution.task_id,
-                    start_time=start_time,
-                    end_time=end_time,
-                )
-            )
+            await call.succeed(result=running.runner.result())
         finally:
-            # Clear the task object only if it wasn't overwritten in the meantime.
-            if self._task_asyncio is aio_task:
-                self._task_asyncio = None
+            # Join this request's execution even after a successor replaced it.
+            if not running.done():
+                running.cancel()
 
-                if not aio_task.done():
-                    aio_task.cancel()
+            try:
+                await running.wait()
+            finally:
+                if self._execution is running:
+                    self._execution = None
 
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await aio_task
+    async def _run_execution(
+        self,
+        running: TaskRun,
+        predecessor: TaskRun | None,
+    ) -> TaskExecutionResult:
+        # Cancellation can target the runner once it has entered.
+        running.entered = True
 
-    async def _execute_task(self, execution: TaskExecution, lifecycle_context: KeywordDict):
-        # Associate the envelope with the task so the handler can reach it via `task.execution`.
-        task = execution.task
-        task.associate_execution(execution)
-        logger.debug(f"execution begun {execution=}")
-        finish_info = TaskFinishInfo(aborted=True)
-        outcome = InternalControllerState.UNKNOWN
-        started = False
+        with self.enter_context():
+            try:
+                if predecessor is not None:
+                    predecessor.cancel("Interrupted")
+                    await defer_cancellation(predecessor.join())
+            finally:
+                # Release the predecessor so repeated interruption cannot retain a chain.
+                predecessor = None
 
-        try:
-            await self._publish_start(execution, lifecycle_context)
-            started = True
+            try:
+                with running.execute() as execution:
+                    logger.info(f"Executing {execution.task.task_type} task")
+                    logger.debug(f"execution begun {execution=}")
 
-            # Find the user-supplied task handler callback for this task type.
-            handler = self._task_handlers.get(type(task))
-            assert handler
+                    await self._publish_start(running)
+                    running.started = True
+                    await running.handler(execution)
+            finally:
+                # Only an entered execution scope needs settlement.
+                if running.start_time is not None:
+                    await defer_cancellation(self._publish_finish(running))
 
-            # Run the task handler.
-            await handler(task)
-        except Exception as e:
-            finish_info = TaskFinishInfo(error=str(e) or type(e).__name__)
-            outcome = InternalControllerState.ERROR
-            raise
-        else:
-            finish_info = TaskFinishInfo()
-            outcome = task.target_state()
-        finally:
-            # Finish settlement before propagating another cancellation.
-            await defer_cancellation(
-                self._publish_finish(execution, finish_info, outcome, started=started)
-            )
+            return running.result()
 
-    async def _publish_start(self, execution: TaskExecution, lifecycle_context: KeywordDict):
+    async def _publish_start(self, running: TaskRun):
+        execution = running.execution
         task = execution.task
 
         async with self._state.updating(self) as update:
@@ -544,52 +670,69 @@ class ControllerImpl(EntityImpl, ControllerInterface):
                         operating.derive(
                             current=InternalControllerState.TRANSITION,
                             target=target,
-                            context=lifecycle_context,
+                            context=running.context,
                         )
                     )
 
             await update(*events)
 
-    async def _publish_finish(
-        self,
-        execution: TaskExecution,
-        finish_info: TaskFinishInfo,
-        outcome: InternalControllerState | None,
-        *,
-        started: bool,
-    ):
+    async def _publish_finish(self, running: TaskRun):
+        execution = running.execution
         task = execution.task
 
         async with self._state.updating(self) as update:
             operating = self._state.operating_state
-            events = [TaskExecutionState(finished=finish_info, execution=execution)]
+            published = self._state.execution_state.execution
+            owned = published is not None and published.task_id == execution.task_id
+            events = [TaskExecutionState(finished=running.finish_info, execution=execution)]
 
             match task:
                 # Republish retained state when recovery start fails.
-                case RecoverTask() if not started:
+                case RecoverTask() if not running.started:
                     events.append(operating.derive())
 
                 # Preserve state reported by a successful recovery handler.
                 case RecoverTask():
-                    if outcome is not None:
-                        events.append(operating.derive(current=outcome))
+                    if running.outcome is not None:
+                        events.append(operating.derive(current=running.outcome))
 
-                # Preserve the prior state if the transition was never applied.
+                # Settle only a transition this execution started.
                 case _ if (
                     task.target_state() is not None
                     and operating.current == InternalControllerState.TRANSITION
+                    and owned
                 ):
-                    events.append(operating.derive(current=outcome, target=None))
+                    events.append(operating.derive(current=running.outcome, target=None))
 
             await update(*events)
 
     @override
+    def add_task_handler[T: Task](
+        self,
+        task_model: type[T],
+        *,
+        task_callback: TaskHandlerCallback[T] | None = None,
+        execution_callback: ExecutionHandlerCallback[T] | None = None,
+    ) -> None:
+        match task_callback, execution_callback:
+            case None, None:
+                raise TypeError("A task handler requires a task or execution callback")
+            case _, None:
+                handler = lambda execution: task_callback(execution.task)
+            case None, _:
+                handler = execution_callback
+            case _:
+                raise TypeError("A task handler takes one callback")
+
+        if task_model in self._task_handlers:
+            raise RuntimeError("multiple handlers for task type")
+
+        self._task_handlers[task_model] = handler
+
+    @override
     def task_handler[T: Task](self, task_model: type[T]):
         def decorator(func: TaskHandlerCallback[T]):
-            if task_model in self._task_handlers:
-                raise RuntimeError("multiple handlers for task type")
-
-            self._task_handlers[task_model] = func
+            self.add_task_handler(task_model, task_callback=func)
             return func
 
         return decorator

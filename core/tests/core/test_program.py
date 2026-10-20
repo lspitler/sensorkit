@@ -11,7 +11,7 @@ import pytest
 from sensorkit.core.impl.controller import ControllerImpl
 from sensorkit.core.impl.program import ProgramImpl
 from sensorkit.core.program import ProgramOffering, ProgramState, ProgramTaskingState
-from sensorkit.core.task import CollectTask
+from sensorkit.core.task import CollectTask, TaskExecution
 
 
 @pytest.mark.asyncio
@@ -187,6 +187,41 @@ async def test_program_publishes_tasking_state(kit):
         await program_client.stop_tasking()
 
     await monitor_task
+
+
+@pytest.mark.asyncio
+async def test_program_reuses_task_instance(kit, service_context):
+    controller = await service_context.register_controller("mycontroller")
+    program = await service_context.register_program("myprogram")
+
+    task_obj = CollectTask()
+    executed: list[uuid.UUID] = []
+    done = asyncio.Event()
+
+    @program.task_factory
+    async def program_tasker():
+        if not done.is_set():
+            await (yield task_obj)
+
+            if len(executed) == 2:
+                done.set()
+
+    async def run_task(execution: TaskExecution[CollectTask]):
+        assert execution.task == task_obj
+        executed.append(execution.task_id)
+
+    controller.add_task_handler(CollectTask, execution_callback=run_task)
+
+    program_client = kit.program("myprogram")
+
+    async with asyncio.timeout(2.0):
+        await kit.controller("mycontroller").enable()
+        await program_client.enable("mycontroller")
+        await program_client.start_tasking()
+        await done.wait()
+        await program_client.stop_tasking()
+
+    assert len(set(executed)) == 2
 
 
 # Legacy state migration: versions before the Task/TaskExecution split stored the program's

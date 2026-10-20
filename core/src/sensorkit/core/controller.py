@@ -618,6 +618,10 @@ class ControllerDevice(Mapping[Any, Any]):
 
 
 type TaskHandlerCallback[T: Task] = Callable[[T], Coroutine[Any, Any, None]]
+"""A task handler receiving its task."""
+
+type ExecutionHandlerCallback[T: Task] = Callable[[TaskExecution[T]], Coroutine[Any, Any, None]]
+"""A task handler receiving its task's execution envelope."""
 
 
 class ControllerInterface(EntityInterface):
@@ -668,8 +672,28 @@ class ControllerInterface(EntityInterface):
         ...
 
     @abstractmethod
+    def add_task_handler[T: Task](
+        self,
+        task_model: type[T],
+        *,
+        task_callback: TaskHandlerCallback[T] | None = None,
+        execution_callback: ExecutionHandlerCallback[T] | None = None,
+    ) -> None:
+        """Register the handler for a task type.
+
+        Supply exactly one callback.
+        A task callback receives the task.
+        An execution callback receives the task's execution envelope.
+
+        Raises:
+            TypeError: If neither or both callbacks are supplied.
+            RuntimeError: If the task type already has a handler.
+        """
+        ...
+
+    @abstractmethod
     def task_handler(self, task_type: type[Task]) -> Callable[..., TaskHandlerCallback]:
-        """Register a handler for the given task type and return a decorator."""
+        """Return a decorator for a handler that receives the task."""
         ...
 
     @abstractmethod

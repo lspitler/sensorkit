@@ -13,7 +13,7 @@ from pydantic import BaseModel, TypeAdapter
 
 from sensorkit.backend.request import CallContext, declare_long_request, declare_request
 from sensorkit.core.device import Abort
-from sensorkit.core.task import CollectTask, InitTask
+from sensorkit.core.task import CollectTask, InitTask, TaskExecution
 from sensorkit.webapi.fastapi import WebAPI, WebAPIConfig
 from sensorkit.webapi.forwarder import SKRecord
 
@@ -309,13 +309,12 @@ async def test_execute_controller_task_with_submission_envelope(webapi_setup):
     seen: dict[str, object] = {}
     done = asyncio.Event()
 
-    @controller.task_handler(InitTask)
-    async def handle(task: InitTask):
-        # The controller associates the execution before invoking the handler, so the
-        # client-supplied context and expiry are reachable here.
-        seen["context"] = dict(task.execution.context)
-        seen["expiry_time"] = task.execution.expiry_time
+    async def handle(execution: TaskExecution[InitTask]):
+        seen["context"] = dict(execution.context)
+        seen["expiry_time"] = execution.expiry_time
         done.set()
+
+    controller.add_task_handler(InitTask, execution_callback=handle)
 
     resp = await client.post(
         "/controller/mycontroller/execute",

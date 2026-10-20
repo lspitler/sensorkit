@@ -175,7 +175,9 @@ async def test_collect_headers_keep_task_context_without_keywords_from_other_cha
     for key in controller.devices:
         controller_impl.use_device(key, subscribe=[Filter] if key == "off-chain" else [])
 
-    controller_impl.task_handler(StandardCollectTask)(controller.collect_task)
+    controller_impl.add_task_handler(
+        StandardCollectTask, execution_callback=controller.collect_task
+    )
     await controller_impl.start_device_subscriptions()
 
     try:
@@ -211,7 +213,9 @@ async def attached(controller_impl, document: str) -> SensorController:
         latitude_degrees=20.0, longitude_degrees=-100.0, altitude_km=1.0))
     controller = SensorController()
     await controller.on_attach()
-    controller_impl.task_handler(StandardCollectTask)(controller.collect_task)
+    controller_impl.add_task_handler(
+        StandardCollectTask, execution_callback=controller.collect_task
+    )
 
     return controller
 

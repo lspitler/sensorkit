@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import json
+from typing import Literal
+
+import pytest
+import uuid_utils.compat as uuid
 from pydantic import BaseModel
 
-from sensorkit.common.keyword import declare_keyword
-from sensorkit.core.task import TaskContextOverlay
+from sensorkit.common.keyword import KeywordDict, declare_keyword
+from sensorkit.core.task import CollectTask, TaskContextOverlay, TaskExecution
 
 
 @declare_keyword
@@ -111,3 +116,49 @@ def test_build_merges_keyword_payloads_field_wise():
     assert isinstance(camera, _MergeCameraConfig)
     assert camera.exposure_time == 5.0  # preserved from `all`
     assert camera.binning == 2  # overridden by `init`
+
+
+class ProbeCollectTask(CollectTask):
+    task_type: Literal["probe_collect"] = "probe_collect"
+    exposures: int
+
+
+@pytest.mark.parametrize(
+    "source_model",
+    [TaskExecution, TaskExecution[CollectTask]],
+    ids=("unparameterized_source", "parent_specialized_source"),
+)
+@pytest.mark.parametrize(
+    "model",
+    [TaskExecution, TaskExecution[ProbeCollectTask]],
+    ids=("unparameterized", "typed"),
+)
+def test_execution_round_trip_keeps_task_subtype(model, source_model):
+    execution = source_model(
+        task=ProbeCollectTask(exposures=3),
+        task_id=uuid.uuid7(),
+        controller_id="mycontroller",
+        context=KeywordDict({"probe": "value"}),
+    )
+
+    wire = execution.model_dump_json()
+    restored = model.model_validate_json(wire)
+
+    assert json.loads(wire)["task"] == {"task_type": "probe_collect", "exposures": 3}
+    assert type(restored.task) is ProbeCollectTask
+    assert restored.task == execution.task
+    assert restored.task_id == execution.task_id
+    assert restored.context["probe"] == "value"
+    assert restored.model_dump_json() == wire
+
+
+def test_task_reused_across_executions():
+    task = ProbeCollectTask(exposures=3)
+    first, second = (
+        TaskExecution(task=task, task_id=uuid.uuid7(), controller_id="mycontroller")
+        for _ in range(2)
+    )
+
+    assert first.task is second.task
+    assert first.task == ProbeCollectTask(exposures=3)
+    assert first.task != ProbeCollectTask(exposures=4)

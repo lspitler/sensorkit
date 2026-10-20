@@ -41,7 +41,7 @@ from sensorkit.core.impl.controller import ControllerImpl
 from sensorkit.core.impl.device import DeviceImpl
 from sensorkit.core.impl.entity import EntityImpl
 from sensorkit.core.impl.program import ProgramImpl
-from sensorkit.core.task import Task
+from sensorkit.core.task import InitTask, StandbyTask, Task, TaskExecution
 from sensorkit.core.trait import declare_archetype, declare_trait
 
 
@@ -396,6 +396,76 @@ async def test_declared_controller():
         )
         await done.wait()
         await svc_decl.stop()
+
+
+@pytest.mark.asyncio
+async def test_declared_controller_execution_handler(kit, service):
+    ctrl = declare_controller(name="execution_controller")
+    received: list[TaskExecution] = []
+
+    @task_handler(ctrl)
+    async def handle(execution: TaskExecution[InitTask]):
+        received.append(execution)
+
+    service.add(ctrl)
+
+    async with asyncio.timeout(5.0):
+        await service.start()
+
+        cli = kit.controller("execution_controller")
+        call = cli.execute_task(InitTask())
+        task_id = (await call.invoke()).execution.task_id
+        await call
+
+    [execution] = received
+    assert type(execution.task) is InitTask
+    assert execution.task_id == task_id
+
+
+async def handle_bare_execution(execution: TaskExecution):
+    pass
+
+
+async def handle_base_task(task: Task):
+    pass
+
+
+async def handle_task_union(task: InitTask | StandbyTask):
+    pass
+
+
+async def handle_execution_union(execution: TaskExecution[InitTask | StandbyTask]):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handler",
+    [handle_bare_execution, handle_base_task, handle_task_union, handle_execution_union],
+    ids=("bare_execution", "base_task", "task_union", "execution_union"),
+)
+async def test_declared_task_handler_requires_concrete_task(kit, service_context, handler):
+    ctrl = declare_controller(name="invalid_controller")
+    task_handler(ctrl)(handler)
+
+    with pytest.raises(DeclarationError):
+        await ctrl.register(kit, service_context)
+
+
+@pytest.mark.asyncio
+async def test_declared_duplicate_task_handler(kit, service_context):
+    ctrl = declare_controller(name="duplicate_controller")
+
+    @task_handler(ctrl)
+    async def handle(task: InitTask):
+        pass
+
+    @task_handler(ctrl)
+    async def handle_execution(execution: TaskExecution[InitTask]):
+        pass
+
+    with pytest.raises(RuntimeError, match="multiple handlers"):
+        await ctrl.register(kit, service_context)
 
 
 @pytest.mark.asyncio

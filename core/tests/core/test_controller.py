@@ -31,7 +31,7 @@ from sensorkit.core.controller import (
     TaskFinishInfo,
 )
 from sensorkit.core.device import DeviceClient
-from sensorkit.core.impl.controller import ControllerImpl
+from sensorkit.core.impl.controller import ControllerImpl, TaskRun
 from sensorkit.core.task import (
     CollectTask,
     InitTask,
@@ -684,7 +684,7 @@ async def test_startup_keeps_settled_state(kit):
 
 
 @pytest.mark.asyncio
-async def test_state_report_waits_for_transition_start(gated_kit, gated_backend):
+async def test_transition_start_follows_held_report(gated_kit, gated_backend):
     async with asyncio.timeout(1.0):
         sc = await gated_kit.register_service("testservice", "0.1.0")
         controller = await sc.register_controller("mycontroller")
@@ -705,24 +705,24 @@ async def test_state_report_waits_for_transition_start(gated_kit, gated_backend)
         earlier = asyncio.create_task(controller.set_internal_state(STANDBY))
         await fault.reached.wait()
 
-        # Queue the lifecycle start behind the held report.
+        # Admission and the lifecycle start wait behind the held report.
         exec_call = cli.execute_task(InitTask())
-        await exec_call.invoke()
-
-        later = asyncio.create_task(controller.set_internal_state(ERROR))
-        await asyncio.sleep(0)
+        accepting = asyncio.create_task(exec_call.invoke())
         fault.release.set()
         await earlier
-
-        with pytest.raises(ValueError):
-            await later
-
+        await accepting
         await started.wait()
+
+        # The running lifecycle task owns the operating state.
+        with pytest.raises(ValueError):
+            await controller.set_internal_state(ERROR)
+
         running = await cli.kv_get_model(ControllerState)
         can_finish.set()
         await exec_call
 
     assert running.operating_state.current == TRANSITION
+    assert running.operating_state.previous == STANDBY
     assert running.operating_state.target == OPERATE
 
 
@@ -787,10 +787,11 @@ async def test_interrupt_during_settlement_completes_it(gated_kit, gated_backend
         await abort_call.invoke()
         await fault.reached.wait()
 
-        # The interrupt cancels the first execution again while it publishes its final state.
+        # The interrupt arrives while the first execution publishes its final state.
         second = cli.execute_task(ShutdownTask(), interrupt=True)
-        second_id = (await second.invoke()).execution.task_id
+        accepting = asyncio.create_task(second.invoke())
         fault.release.set()
+        second_id = (await accepting).execution.task_id
         await second
         await abort_call.wait()
 
@@ -1101,6 +1102,510 @@ async def test_controller_use_device(kit):
 
     # 9. stop_device_subscriptions()
     await controller.stop_device_subscriptions()
+
+
+# Dispatch ownership
+
+
+@dataclass
+class HeldCleanup:
+    """Handler that waits for release before its cancellation cleanup ends."""
+
+    started: asyncio.Event = field(default_factory=asyncio.Event)
+    cleaning: asyncio.Event = field(default_factory=asyncio.Event)
+    release: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def handle(self, _):
+        self.started.set()
+
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cleaning.set()
+            await self.release.wait()
+
+
+def collect_run(controller: ControllerImpl) -> TaskRun:
+    return TaskRun.create(
+        str(controller.entity),
+        CollectTask(),
+        context=None,
+        expiry_time=None,
+    )
+
+
+async def join_runs(runs: list[TaskRun]):
+    """Cancel and join every run a test attached."""
+    async with asyncio.timeout(1.0):
+        for run in runs:
+            run.cancel()
+            await run.wait()
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_entry_joins_predecessor(kit, controller_impl):
+    held = HeldCleanup()
+    second_ran = asyncio.Event()
+    third_ran = asyncio.Event()
+    runs: list[TaskRun] = []
+
+    async def run_second(_):
+        second_ran.set()
+
+    async def run_third(_):
+        third_ran.set()
+
+    first = collect_run(controller_impl)
+    first.attach(held.handle, controller_impl._run_execution(first, None))
+    runs.append(first)
+
+    try:
+        async with asyncio.timeout(1.0):
+            await held.started.wait()
+
+        second = collect_run(controller_impl)
+        second.attach(run_second, controller_impl._run_execution(second, first))
+        runs.append(second)
+
+        third = collect_run(controller_impl)
+        third.attach(run_third, controller_impl._run_execution(third, second))
+        runs.append(third)
+
+        # Cancel before the runner takes its first step.
+        second.cancel()
+        assert not second.entered
+
+        async with asyncio.timeout(1.0):
+            await held.cleaning.wait()
+
+        assert second.entered
+        assert not second.done()
+        assert not third.done()
+
+        held.release.set()
+
+        async with asyncio.timeout(1.0):
+            await third.wait()
+
+        state = await kit.controller(controller_impl.entity).kv_get_model(ControllerState)
+    finally:
+        held.release.set()
+        await join_runs(runs)
+
+    assert first.runner.cancelled()
+    assert second.runner.cancelled()
+    assert second.start_time is None
+    assert not second_ran.is_set()
+    assert third_ran.is_set()
+    assert third.runner.result().task_id == third.execution.task_id
+    assert is_finished(state, third.execution.task_id)
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_requests_once(controller_impl):
+    held = HeldCleanup()
+    runs: list[TaskRun] = []
+
+    async def run_collect(_):
+        pass
+
+    first = collect_run(controller_impl)
+    first.attach(held.handle, controller_impl._run_execution(first, None))
+    runs.append(first)
+
+    try:
+        async with asyncio.timeout(1.0):
+            await held.started.wait()
+
+        second = collect_run(controller_impl)
+        second.attach(run_collect, controller_impl._run_execution(second, first))
+        runs.append(second)
+
+        async with asyncio.timeout(1.0):
+            await held.cleaning.wait()
+
+        # The successor already canceled its predecessor.
+        first.cancel()
+        second.cancel()
+        second.cancel()
+
+        assert first.runner.cancelling() == 1
+        assert second.runner.cancelling() == 1
+
+        held.release.set()
+
+        async with asyncio.timeout(1.0):
+            await asyncio.gather(first.wait(), second.wait())
+    finally:
+        held.release.set()
+        await join_runs(runs)
+
+    assert second.runner.cancelled()
+    assert second.start_time is None
+
+
+@pytest.mark.asyncio
+async def test_predecessor_failure_skips_successor(kit, controller_impl):
+    started = asyncio.Event()
+    ran = asyncio.Event()
+    runs: list[TaskRun] = []
+
+    async def fail_on_cancel(_):
+        started.set()
+
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise RuntimeError("cleanup failed") from None
+
+    async def run_collect(_):
+        ran.set()
+
+    first = collect_run(controller_impl)
+    first.attach(fail_on_cancel, controller_impl._run_execution(first, None))
+    runs.append(first)
+
+    try:
+        async with asyncio.timeout(1.0):
+            await started.wait()
+
+        second = collect_run(controller_impl)
+        second.attach(run_collect, controller_impl._run_execution(second, first))
+        runs.append(second)
+
+        async with asyncio.timeout(1.0):
+            await second.wait()
+
+        state = await kit.controller(controller_impl.entity).kv_get_model(ControllerState)
+    finally:
+        await join_runs(runs)
+
+    assert isinstance(first.runner.exception(), RuntimeError)
+    assert isinstance(second.runner.exception(), RuntimeError)
+    assert second.start_time is None
+    assert not ran.is_set()
+
+    # The failed predecessor's settlement remains the published execution.
+    assert is_finished(state, first.execution.task_id)
+    assert state.execution_state.finished.error
+
+
+@pytest.mark.asyncio
+async def test_abort_pending_execution_joins_predecessor(kit, controller_impl):
+    held = HeldCleanup()
+    shutdown_ran = asyncio.Event()
+
+    @controller_impl.task_handler(InitTask)
+    async def run_init(_: InitTask):
+        pass
+
+    @controller_impl.task_handler(ShutdownTask)
+    async def run_shutdown(_: ShutdownTask):
+        shutdown_ran.set()
+
+    controller_impl.task_handler(CollectTask)(held.handle)
+    cli = kit.controller(controller_impl.entity)
+
+    try:
+        async with asyncio.timeout(2.0), watch_state(cli) as states:
+            await cli.execute_task(InitTask(), context=KeywordDict({"mode": "init"}))
+            settled = await cli.kv_get_model(ControllerState)
+
+            collect = cli.execute_task(CollectTask())
+            collect_id = (await collect.invoke()).execution.task_id
+            await held.started.wait()
+
+            shutdown = cli.execute_task(ShutdownTask(), interrupt=True)
+            shutdown_id = (await shutdown.invoke()).execution.task_id
+            await held.cleaning.wait()
+
+            abort = cli.abort_task(shutdown_id)
+            response = await abort.invoke()
+            held.release.set()
+            await abort
+
+            with pytest.raises(CallError):
+                await shutdown.wait()
+
+            with pytest.raises(CallError):
+                await collect.wait()
+
+            seen = await collect_until(states, lambda state: is_finished(state, collect_id))
+            state = await cli.kv_get_model(ControllerState)
+    finally:
+        held.release.set()
+
+    assert response.aborting
+    assert response.task_id == shutdown_id
+    assert not shutdown_ran.is_set()
+
+    # The pending shutdown published nothing of its own.
+    assert all(execution_id(snapshot) != shutdown_id for snapshot in seen)
+    assert state.operating_state == settled.operating_state
+    assert is_finished(state, collect_id)
+    assert state.execution_state.finished.aborted
+    assert not state.execution_state.aborting
+
+
+@pytest.mark.asyncio
+async def test_interrupting_requests_join_in_admission_order(kit, controller_impl):
+    held = HeldCleanup()
+    entered: list[str] = []
+    can_finish = asyncio.Event()
+
+    controller_impl.task_handler(CollectTask)(held.handle)
+
+    @controller_impl.task_handler(InitTask)
+    async def run_init(_: InitTask):
+        entered.append("init")
+
+    @controller_impl.task_handler(StandbyTask)
+    async def run_standby(_: StandbyTask):
+        entered.append("standby")
+        await can_finish.wait()
+
+    cli = kit.controller(controller_impl.entity)
+
+    try:
+        async with asyncio.timeout(2.0), watch_state(cli) as states:
+            collect = cli.execute_task(CollectTask())
+            collect_id = (await collect.invoke()).execution.task_id
+            await held.started.wait()
+
+            init = cli.execute_task(InitTask(), interrupt=True)
+            init_id = (await init.invoke()).execution.task_id
+            await held.cleaning.wait()
+
+            standby = cli.execute_task(StandbyTask(), interrupt=True)
+            standby_id = (await standby.invoke()).execution.task_id
+
+            # A pending replacement still occupies the controller.
+            with pytest.raises(CallError):
+                await cli.execute_task(CollectTask()).invoke()
+
+            assert entered == []
+            held.release.set()
+
+            with pytest.raises(CallError):
+                await init.wait()
+
+            with pytest.raises(CallError):
+                await collect.wait()
+
+            # Superseded requests leave the newest execution current.
+            seen = await collect_until(
+                states,
+                lambda state: (
+                    execution_id(state) == standby_id and state.execution_state.executing
+                ),
+            )
+            assert controller_impl.task_running()
+
+            with pytest.raises(CallError):
+                await cli.abort_task(init_id).invoke()
+
+            can_finish.set()
+            await standby
+            seen += await collect_until(states, lambda state: is_finished(state, standby_id))
+    finally:
+        held.release.set()
+        can_finish.set()
+
+    assert entered == ["standby"]
+    assert operating_history(seen, collect_id, init_id, standby_id) == [
+        (collect_id, UNKNOWN),
+        (collect_id, UNKNOWN),
+        (standby_id, TRANSITION),
+        (standby_id, STANDBY),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rejected_requests_leave_execution_running(kit, controller_impl):
+    started = asyncio.Event()
+    can_finish = asyncio.Event()
+
+    @controller_impl.task_handler(CollectTask)
+    async def run_collect(_: CollectTask):
+        started.set()
+        await can_finish.wait()
+
+    cli = kit.controller(controller_impl.entity)
+
+    try:
+        async with asyncio.timeout(2.0):
+            collect = cli.execute_task(CollectTask())
+            await collect.invoke()
+            await started.wait()
+            running = await cli.kv_get_model(ControllerState)
+
+            with pytest.raises(CallError):
+                await cli.execute_task(RecoverTask(), interrupt=True).invoke()
+
+            await cli.disable()
+
+            with pytest.raises(CallError):
+                await cli.execute_task(CollectTask(), interrupt=True).invoke()
+
+            rejected = await cli.kv_get_model(ControllerState)
+            can_finish.set()
+            await collect
+    finally:
+        can_finish.set()
+
+    assert rejected.operating_state == running.operating_state
+    assert rejected.execution_state == running.execution_state
+
+
+@pytest.mark.asyncio
+async def test_abort_rejects_other_or_finished_execution(kit, controller_impl):
+    started = asyncio.Event()
+    can_finish = asyncio.Event()
+
+    @controller_impl.task_handler(InitTask)
+    async def run_init(_: InitTask):
+        started.set()
+        await can_finish.wait()
+
+    cli = kit.controller(controller_impl.entity)
+
+    try:
+        async with asyncio.timeout(2.0):
+            init = cli.execute_task(InitTask())
+            task_id = (await init.invoke()).execution.task_id
+            await started.wait()
+            running = await cli.kv_get_model(ControllerState)
+
+            with pytest.raises(CallError):
+                await cli.abort_task(uuid.uuid7()).invoke()
+
+            mismatched = await cli.kv_get_model(ControllerState)
+            can_finish.set()
+            await init
+            settled = await cli.kv_get_model(ControllerState)
+
+            with pytest.raises(CallError):
+                await cli.abort_task(task_id).invoke()
+
+            finished = await cli.kv_get_model(ControllerState)
+    finally:
+        can_finish.set()
+
+    assert mismatched.model_dump() == running.model_dump()
+    assert finished.model_dump() == settled.model_dump()
+    assert settled.operating_state.current == OPERATE
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_interrupt_settles_with_its_context(kit, controller_impl):
+    started = asyncio.Event()
+
+    @controller_impl.task_handler(InitTask)
+    async def run_init(_: InitTask):
+        started.set()
+        await asyncio.Event().wait()
+
+    @controller_impl.task_handler(StandbyTask)
+    async def run_standby(_: StandbyTask):
+        pass
+
+    cli = kit.controller(controller_impl.entity)
+
+    async with asyncio.timeout(2.0), watch_state(cli) as states:
+        init = cli.execute_task(InitTask(), context=KeywordDict({"mode": "init"}))
+        init_id = (await init.invoke()).execution.task_id
+        await started.wait()
+
+        standby = cli.execute_task(
+            StandbyTask(),
+            context=KeywordDict({"mode": "standby"}),
+            interrupt=True,
+        )
+        standby_id = (await standby.invoke()).execution.task_id
+        await standby
+
+        with pytest.raises(CallError):
+            await init.wait()
+
+        seen = await collect_until(states, lambda state: is_finished(state, standby_id))
+
+    history = [
+        (execution_id(state), state.operating_state.current, state.operating_state.context)
+        for state in seen
+        if execution_id(state) in (init_id, standby_id)
+    ]
+
+    assert history == [
+        (init_id, TRANSITION, {"mode": "init"}),
+        (init_id, UNKNOWN, {"mode": "init"}),
+        (standby_id, TRANSITION, {"mode": "standby"}),
+        (standby_id, STANDBY, {"mode": "standby"}),
+    ]
+
+
+# Task handler forms
+
+
+@pytest.mark.asyncio
+async def test_task_handlers_receive_declared_input(kit, controller_impl):
+    received: dict[str, Any] = {}
+
+    async def run_init(execution: TaskExecution[InitTask]):
+        received["init"] = execution
+
+    async def run_standby(task: StandbyTask):
+        received["standby"] = task
+
+    @controller_impl.task_handler(CollectTask)
+    async def run_collect(task: CollectTask):
+        received["collect"] = task
+
+    controller_impl.add_task_handler(InitTask, execution_callback=run_init)
+    controller_impl.add_task_handler(StandbyTask, task_callback=run_standby)
+    cli = kit.controller(controller_impl.entity)
+
+    async with asyncio.timeout(2.0):
+        init = cli.execute_task(InitTask(), context=KeywordDict({"probe": "value"}))
+        init_id = (await init.invoke()).execution.task_id
+        await init
+
+        await cli.execute_task(StandbyTask())
+        await cli.execute_task(CollectTask())
+
+    assert type(received["init"]) is TaskExecution
+    assert type(received["init"].task) is InitTask
+    assert received["init"].task_id == init_id
+    assert received["init"].context["probe"] == "value"
+
+    assert type(received["standby"]) is StandbyTask
+    assert type(received["collect"]) is CollectTask
+
+
+@pytest.mark.asyncio
+async def test_add_task_handler_takes_one_callback(controller_impl):
+    async def run_init(task: InitTask):
+        pass
+
+    async def run_init_execution(execution: TaskExecution[InitTask]):
+        pass
+
+    with pytest.raises(TypeError):
+        controller_impl.add_task_handler(InitTask)
+
+    with pytest.raises(TypeError):
+        controller_impl.add_task_handler(
+            InitTask,
+            task_callback=run_init,
+            execution_callback=run_init_execution,
+        )
+
+    controller_impl.add_task_handler(InitTask, task_callback=run_init)
+
+    with pytest.raises(RuntimeError):
+        controller_impl.add_task_handler(InitTask, execution_callback=run_init_execution)
+
+    with pytest.raises(RuntimeError):
+        controller_impl.task_handler(InitTask)(run_init)
 
 
 # Legacy state migration: versions before the Task/TaskExecution split stored the executing

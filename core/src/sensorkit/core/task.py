@@ -7,7 +7,7 @@ from collections.abc import Generator
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, override
 
-from pydantic import BaseModel, BeforeValidator, Field, PrivateAttr
+from pydantic import BaseModel, BeforeValidator, Field, PrivateAttr, SerializeAsAny
 
 from sensorkit.common.keyword import KeywordDict, declare_keyword, validated_items
 from sensorkit.common.model import ModelRegistry, RegistryBaseModel
@@ -27,67 +27,12 @@ class Task(RegistryBaseModel):
 
     task_type: Literal[None] = None
 
-    # The execution envelope is associated by the controller immediately before a task handler is
-    # invoked. It is excluded from serialization and only meaningful server-side within a handler.
-    _execution: TaskExecution | None = PrivateAttr(default=None)
-
     # Task model registry.
     registry: ClassVar[ModelRegistry[Task]] = ModelRegistry(discriminator="task_type")
 
     @classmethod
     def model_registry(cls):
         return cls.registry
-
-    @property
-    def execution(self) -> TaskExecution:
-        """The `TaskExecution` envelope associated with this task.
-
-        The controller associates the envelope just before invoking a task handler, so it is
-        always available from within a handler.
-
-        Returns:
-            The associated execution envelope.
-
-        Raises:
-            RuntimeError: If accessed when no execution has been associated (e.g. outside a task
-                handler).
-        """
-        if self._execution is None:
-            raise RuntimeError("task has no execution context (accessed outside a task handler?)")
-
-        return self._execution
-
-    def associate_execution(self, execution: TaskExecution) -> None:
-        """Associate an execution envelope with this task.
-
-        The controller calls this immediately before invoking a task handler so the handler can
-        reach the envelope via [`execution`][sensorkit.core.task.Task.execution].
-
-        Args:
-            execution: The execution envelope to associate with this task.
-
-        Raises:
-            RuntimeError: If an execution is already associated with this task.
-        """
-        if self._execution is not None:
-            raise RuntimeError("task already has an associated execution")
-
-        self._execution = execution
-
-    def __eq__(self, other: object) -> bool:
-        # The execution back-link is transient runtime state (excluded from serialization), so it
-        # must not affect equality: two tasks with the same semantic content are equal whether or
-        # not either is currently associated with an execution.
-        if not isinstance(other, Task):
-            return NotImplemented
-
-        return (
-            type(self) is type(other)
-            and self.__dict__ == other.__dict__
-            and self.__pydantic_extra__ == other.__pydantic_extra__
-        )
-
-    __hash__ = None
 
     def target_state(self) -> InternalControllerState | None:
         """Return the state-transition target if this is a lifecycle task.
@@ -199,15 +144,21 @@ class TaskInfo(BaseModel):
         yield "SKCTRL", (self.controller_id, "SensorKit controller name")
 
 
-class TaskExecution(BaseModel):
+class TaskExecution[T: Task](BaseModel):
     """Execution envelope wrapping a `Task`.
 
     Carries server-minted identity (`task_id`, `controller_id`) and client-supplied execution
     parameters (`context`, `expiry_time`). This type is not user-extensible; the extensible
     semantic definition is the embedded `task`.
+
+    A handler annotated with `TaskExecution[T]` receives execution metadata and a task
+    of type `T`. Controller-produced envelopes use the unparameterized model.
+    Serialization preserves all fields of the concrete task subclass.
+    Client executions returned by `ControllerClient.start_task` can be awaited for
+    their result.
     """
 
-    task: Task
+    task: SerializeAsAny[T]
     task_id: uuid.UUID
     controller_id: str
     context: Annotated[

@@ -9,7 +9,9 @@ from pydantic import BaseModel
 from sensorkit.core.controller import (
     ControllerDevice,
     ControllerInterface,
+    ExecutionHandlerCallback,
     InternalControllerState,
+    TaskHandlerCallback,
 )
 from sensorkit.core.device import DeviceCommand, DeviceInterface
 from sensorkit.core.entity import EntityInterface
@@ -124,6 +126,20 @@ class ControllerDelegate(EntityDelegate, ControllerInterface):
     @override
     async def update_context(self, *args, **kwargs) -> Context:
         return await self.delegate_target.update_context(*args, **kwargs)
+
+    @override
+    def add_task_handler[T: Task](
+        self,
+        task_model: type[T],
+        *,
+        task_callback: TaskHandlerCallback[T] | None = None,
+        execution_callback: ExecutionHandlerCallback[T] | None = None,
+    ) -> None:
+        return self.delegate_target.add_task_handler(
+            task_model,
+            task_callback=task_callback,
+            execution_callback=execution_callback,
+        )
 
     @override
     def task_handler(

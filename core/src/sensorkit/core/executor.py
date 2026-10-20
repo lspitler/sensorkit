@@ -221,9 +221,6 @@ class TaskingLoop:
 
             return False
 
-        # Client-side association: the program can reach the execution (and its result future) via
-        # `task.execution`.
-        task.associate_execution(execution)
         await self._notify_task_change(execution)
 
         try:

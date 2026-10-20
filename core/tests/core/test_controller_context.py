@@ -97,10 +97,9 @@ async def test_lifecycle_success_records_input(kit, controller, kind):
     started = asyncio.Event()
     can_finish = asyncio.Event()
 
-    @controller.task_handler(InitTask)
-    async def run_init(task: InitTask):
+    async def run_init(execution: TaskExecution[InitTask]):
         # Changes to the execution context stay out of the recorded input.
-        context = task.execution.context
+        context = execution.context
 
         if option := context.get(EnclosureOption):
             option.limits.append(90.0)
@@ -110,6 +109,8 @@ async def test_lifecycle_success_records_input(kit, controller, kind):
 
         started.set()
         await can_finish.wait()
+
+    controller.add_task_handler(InitTask, execution_callback=run_init)
 
     cli = kit.controller("mycontroller")
 

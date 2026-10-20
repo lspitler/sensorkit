@@ -16,7 +16,7 @@ from sensorkit.api.bootstrap import connect
 from sensorkit.backend.request import CallContext, LongRequest, Request, RequestBase
 from sensorkit.common.importutil import get_caller_module
 from sensorkit.core.client import SensorKit, ServiceContext
-from sensorkit.core.controller import TaskHandlerCallback
+from sensorkit.core.controller import ExecutionHandlerCallback, TaskHandlerCallback
 from sensorkit.core.delegate import (
     ControllerDelegate,
     DeviceDelegate,
@@ -30,7 +30,7 @@ from sensorkit.core.impl.controller import ControllerImpl
 from sensorkit.core.impl.device import DeviceImpl
 from sensorkit.core.impl.entity import EntityImpl
 from sensorkit.core.impl.program import ProgramImpl
-from sensorkit.core.task import Task
+from sensorkit.core.task import Task, TaskExecution
 from sensorkit.core.trait import Archetype, Trait
 
 type InitDeinitCallback = Callable[[], Coroutine[Any, Any, None] | None]
@@ -118,6 +118,20 @@ def introspect_param_type(func: Callable):
         raise DeclarationError("Callback must have exactly one typed parameter")
 
     return next(iter(type_hints.values()))
+
+
+def _envelope_task_type(annotation: Any) -> Any | None:
+    """Return the task annotation of an execution envelope, or None for other annotations."""
+    match annotation:
+        case type() if issubclass(annotation, TaskExecution):
+            return annotation.model_fields["task"].annotation
+
+    return None
+
+
+def _is_concrete_task(annotation: Any) -> bool:
+    """Return True if the annotation names one task subclass."""
+    return isinstance(annotation, type) and issubclass(annotation, Task) and annotation is not Task
 
 
 def introspect_decls(obj):
@@ -310,12 +324,17 @@ class DeclaredController(DeclaredEntity[ControllerImpl], ControllerDelegate):
 
         match kind:
             case CallbackKind.TASK_HANDLER:
-                task_type = introspect_param_type(func)
+                annotation = introspect_param_type(func)
 
-                if not issubclass(task_type, Task):
-                    raise DeclarationError("Task handler parameter has incorrect type")
-
-                self.impl.task_handler(task_type)(func)
+                match _envelope_task_type(annotation):
+                    case None if _is_concrete_task(annotation):
+                        self.impl.add_task_handler(annotation, task_callback=func)
+                    case task_type if _is_concrete_task(task_type):
+                        self.impl.add_task_handler(task_type, execution_callback=func)
+                    case _:
+                        raise DeclarationError(
+                            "Task handler parameter must name a concrete task type"
+                        )
 
 
 class DeclaredProgram(DeclaredEntity[ProgramImpl], ProgramDelegate):
@@ -589,8 +608,13 @@ def command_handler(arg: DeclaredEntity | CommandHandlerCallback):
             return _decorator(None, CallbackKind.COMMAND_HANDLER, arg)
 
 
-def task_handler(arg: DeclaredEntity | TaskHandlerCallback):
-    """Declare a task handler for a controller."""
+def task_handler(arg: DeclaredEntity | TaskHandlerCallback | ExecutionHandlerCallback):
+    """Declare a task handler for a controller.
+
+    The handler's parameter annotation selects its task type and input.
+    A task annotation receives the task.
+    A `TaskExecution[T]` annotation receives the execution envelope of a `T` task.
+    """
     match arg:
         case DeclaredEntity():
             return functools.partial(_decorator, arg, CallbackKind.TASK_HANDLER)
