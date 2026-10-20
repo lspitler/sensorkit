@@ -1,18 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import math
 from abc import abstractmethod
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum, auto
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Collection, Mapping, Self
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Collection, Mapping, NoReturn, Self
 
 import uuid_utils.compat as uuid
 from pydantic import BaseModel, Field, model_validator
 
 from sensorkit.backend.event import Event
 from sensorkit.backend.request import Call, declare_long_request, declare_request
+from sensorkit.common.aio import AsyncObserver, OverflowPolicy, defer_cancellation
 from sensorkit.common.keyword import KeywordDict
 from sensorkit.core.device import DeviceClient
 from sensorkit.core.entity import EntityClient, EntityInterface, EntityRef
@@ -371,6 +375,229 @@ class ControllerRef(EntityRef[ControllerClient]):
 
     def _get_client(self, kit: SensorKit) -> ControllerClient:
         return kit.controller(self.name)
+
+
+class ControllerStateUnknown(Exception):
+    """Controller state is unavailable because observation is not ready or has ended."""
+
+
+class ControllerMonitor:
+    """Continuously observe the state a controller reports.
+
+    A monitor has one observation lifetime. Create another to observe again after
+    failure or stop. Observation health does not prove the controller is alive.
+    """
+
+    def __init__(self, controller: ControllerClient):
+        self.controller = controller
+        self._observer: AsyncObserver[ControllerOperatingState] = AsyncObserver()
+        self._state: ControllerState | None = None
+        self._lifecycle: (
+            tuple[InternalControllerState, InternalControllerState | None, KeywordDict] | None
+        ) = None
+        self._error: Exception | None = None
+        self._reader: asyncio.Task[None] | None = None
+        self._teardown: asyncio.Task[None] | None = None
+
+        # Set by the first state, a failure, or a stop.
+        self._settled = asyncio.Event()
+
+    async def start(self, *, timeout: float = 10.0) -> None:
+        """Start observation and wait for the first valid state.
+
+        A state that does not exist yet is awaited until created.
+
+        Args:
+            timeout: Seconds to wait for the first valid state.
+
+        Raises:
+            ValueError: If `timeout` is not positive and finite.
+            RuntimeError: If the monitor was already started.
+            TimeoutError: If no valid state arrives in time.
+            ControllerStateUnknown: If observation fails or stops first.
+        """
+        if not (math.isfinite(timeout) and timeout > 0):
+            raise ValueError(f"timeout must be positive and finite, got {timeout}")
+
+        if self._reader is not None:
+            raise RuntimeError("A controller monitor can only be started once")
+
+        self._reader = asyncio.create_task(self._read())
+
+        try:
+            async with asyncio.timeout(timeout):
+                await self._settled.wait()
+        except TimeoutError:
+            error = TimeoutError(f"{self.controller.entity} state not observed in {timeout} s")
+            self._fail(error)
+            await self._abandon(error)
+        except asyncio.CancelledError as e:
+            await self._abandon(e)
+
+        try:
+            self._healthy_state()
+        except ControllerStateUnknown as e:
+            await self._abandon(e)
+
+    async def stop(self) -> None:
+        """Stop observation and wait until its subscription is released.
+
+        Repeated calls join the same cleanup. Before the first start, this does nothing.
+        Subscription cleanup failures propagate to the caller.
+        """
+        if self._reader is not None:
+            await self._shut_down()
+
+    @property
+    def state(self) -> ControllerState:
+        """Copy of the latest controller state.
+
+        Raises:
+            ControllerStateUnknown: If observation is not ready, failed, or stopped.
+        """
+        return self._healthy_state().model_copy(deep=True)
+
+    @property
+    def operating_state(self) -> ControllerOperatingState:
+        """Copy of the latest operating state.
+
+        Raises:
+            ControllerStateUnknown: If observation is not ready, failed, or stopped.
+        """
+        return self._healthy_state().operating_state.model_copy(deep=True)
+
+    @property
+    def last_state(self) -> ControllerState | None:
+        """Copy of the last state received, including after observation ends."""
+        return None if self._state is None else self._state.model_copy(deep=True)
+
+    @property
+    def error(self) -> Exception | None:
+        """The first observation failure, retained after shutdown."""
+        return self._error
+
+    @contextlib.contextmanager
+    def state_changes(
+        self,
+        *,
+        initial_value: bool = True,
+        maxsize: int = 64,
+        overflow: OverflowPolicy = "close",
+    ) -> Iterator[asyncio.Queue[ControllerOperatingState]]:
+        """Subscribe to changes of operating state, target, or lifecycle context.
+
+        Subscribers share each report and must not modify it. The queue shuts down
+        when observation fails or stops, or on overflow with the `close` policy.
+
+        Args:
+            initial_value: Whether to queue the current report first.
+            maxsize: Bound on queued reports.
+            overflow: Handling of a full queue. `close` shuts down this queue only.
+                `drop_oldest` discards its oldest report.
+
+        Yields:
+            The subscriber queue, unsubscribed on exit.
+
+        Raises:
+            ControllerStateUnknown: If observation is not ready, failed, or stopped.
+            ValueError: If `maxsize` or `overflow` is invalid.
+        """
+        self._healthy_state()
+
+        with self._observer.subscription(
+            initial_value=initial_value, maxsize=maxsize, overflow=overflow
+        ) as queue:
+            yield queue
+
+    def _healthy_state(self) -> ControllerState:
+        """Return the cached state, or raise if observation is unavailable."""
+        if self._state is not None and not self._observer.closed:
+            return self._state
+
+        match self._error, self._observer.closed:
+            case None, False:
+                reason = "is not ready"
+            case None, True:
+                reason = "stopped"
+            case _:
+                reason = "failed"
+
+        raise ControllerStateUnknown(
+            f"{self.controller.entity} state is unknown because observation {reason}"
+        ) from self._error
+
+    async def _read(self):
+        states = self.controller.kv_monitor_model(ControllerState, strict=True)
+
+        try:
+            async with contextlib.aclosing(states):
+                async for state in states:
+                    self._receive(state)
+
+            raise RuntimeError(f"{self.controller.entity} state stream ended")
+        except asyncio.CancelledError as e:
+            if self._teardown is None:
+                failure = RuntimeError(f"{self.controller.entity} state observation canceled")
+                failure.__cause__ = e
+                self._fail(failure)
+
+            raise
+        except Exception as e:
+            # Cleanup failures after a stop belong to the stopping caller.
+            if self._teardown is not None:
+                raise
+
+            self._fail(e)
+
+    def _receive(self, state: ControllerState):
+        operating = state.operating_state
+        lifecycle = (operating.current, operating.target, operating.context)
+        self._state = state
+
+        if lifecycle != self._lifecycle:
+            self._lifecycle = lifecycle
+
+            # Subscribers share this copy, apart from the cache.
+            self._observer.notify(operating.model_copy(deep=True))
+
+        self._settled.set()
+
+    def _fail(self, error: Exception):
+        """Record the first failure and end observation."""
+        if self._error is None:
+            self._error = error
+
+        self._observer.close()
+        self._settled.set()
+
+    async def _abandon(self, failure: BaseException) -> NoReturn:
+        """Join teardown after a failed start, then raise the startup failure."""
+        # A later stop can report cleanup failure without replacing the startup failure.
+        with contextlib.suppress(Exception):
+            await self._shut_down()
+
+        raise failure
+
+    async def _shut_down(self):
+        await defer_cancellation(self._request_teardown())
+
+    def _request_teardown(self) -> asyncio.Task[None]:
+        if self._teardown is None:
+            # No await before cancellation, so the reader cannot deliver after closure.
+            self._observer.close()
+            self._settled.set()
+            self._reader.cancel()
+            self._teardown = asyncio.create_task(self._join_reader(self._reader))
+
+        return self._teardown
+
+    @staticmethod
+    async def _join_reader(reader: asyncio.Task[None]):
+        # The reader's own cancellation is expected and does not propagate.
+        await asyncio.wait((reader,))
+
+        if not reader.cancelled():
+            reader.result()
 
 
 @dataclass
