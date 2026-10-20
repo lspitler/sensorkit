@@ -166,9 +166,11 @@ services:
         - base=service:config
       dockerfile_inline: |
         FROM base
+        USER root
         RUN apt-get update \
          && apt-get install -y --no-install-recommends astrometry.net \
          && rm -rf /var/lib/apt/lists/*
+        USER sensorkit
     image: sensorkit-senpai
     pull_policy: never
     command: service run SENPAI sensorkit.senpai.service
