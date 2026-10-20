@@ -123,7 +123,8 @@ async def config_load(kit, *, file: str | None, force: bool, dry_run: bool, verb
             raise
 
         console.print(f"[bold red]ERROR: {message}[/bold red]")
-        return
+        # SystemExit, not a click exception, so report_errors passes it through.
+        raise SystemExit(1) from e
 
     ekv = config.entity_kv
     status = {id(model): "🆗  Unchanged" for models in ekv.values() for model in models}
@@ -155,7 +156,7 @@ async def config_load(kit, *, file: str | None, force: bool, dry_run: bool, verb
 
         if any(isinstance(result, Exception) for result in results):
             console.print(f"[bold red]ERROR: config update failed with {sum(1 for result in results if isinstance(result, Exception))} exceptions[/bold red]")
-            return
+            raise SystemExit(1)
 
     if verbose >= 1:
         print_ekv(config.entity_kv, status=status, show_values=verbose >= 2)
