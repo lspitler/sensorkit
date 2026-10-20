@@ -15,9 +15,9 @@ name: sensorkit
 
 x-common-environment: &common-env
   NATS_URL: nats://nats:4222
-  SENSORKIT_CONFIG: /sensorkit.yaml
 #  SENSORKIT_DEBUG: 1
 
+# Only the config loader parses takotruck.yaml; services read their config from NATS.
 x-config-file: &config-file "./takotruck.yaml:/sensorkit.yaml:ro"
 x-env-file:    &env-file    "/opt/sk/.env:/opt/sk/.env:ro"
 x-data-dir:    &data-dir    "/opt/sk/data:/opt/sk/data"
@@ -62,8 +62,6 @@ services:
     command: service run TakoTruck sensorkit.sensor
     environment:
       <<: *common-env
-    volumes:
-      - *config-file
     restart: unless-stopped
     depends_on:
       config:
@@ -79,7 +77,6 @@ services:
       NATS_URL: nats://localhost:4222
     network_mode: host
     volumes:
-      - *config-file
       - *data-dir
     restart: unless-stopped
     depends_on:
@@ -95,8 +92,6 @@ services:
       <<: *common-env
       NATS_URL: nats://localhost:4222
     network_mode: host
-    volumes:
-      - *config-file
     restart: unless-stopped
     depends_on:
       config:
@@ -110,7 +105,6 @@ services:
     environment:
       <<: *common-env
     volumes:
-      - *config-file
       - *data-dir
     restart: unless-stopped
     depends_on:
@@ -125,7 +119,6 @@ services:
     environment:
       <<: *common-env
     volumes:
-      - *config-file
       - *env-file
     restart: unless-stopped
     depends_on:
@@ -152,7 +145,6 @@ services:
     environment:
       <<: *common-env
     volumes:
-      - *config-file
       - *data-dir
       - "/opt/sk/senpai_TakoTruck.yaml:/opt/sk/senpai_TakoTruck.yaml:ro"
       - "/opt/sk/catalogs:/opt/sk/catalogs:ro"
@@ -168,8 +160,6 @@ services:
     command: service run agent sensorkit.auto.agent
     environment:
       <<: *common-env
-    volumes:
-      - *config-file
     restart: unless-stopped
     depends_on:
       config:
@@ -190,7 +180,6 @@ services:
     ports:
       - "8200:8200"
     volumes:
-      - *config-file
       - *data-dir
     restart: unless-stopped
     depends_on:
@@ -205,7 +194,6 @@ services:
     environment:
       <<: *common-env
     volumes:
-      - *config-file
       - *env-file
     restart: unless-stopped
     depends_on:
@@ -222,7 +210,6 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - *config-file
       - *data-dir
     restart: unless-stopped
     depends_on:

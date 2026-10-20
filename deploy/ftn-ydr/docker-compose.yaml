@@ -14,9 +14,9 @@ name: sensorkit
 
 x-common-environment: &common-env
   NATS_URL: nats://nats:4222
-  SENSORKIT_CONFIG: /sensorkit.yaml
 #  SENSORKIT_DEBUG: 1
 
+# Only the config loader parses ftn-ydr.yaml; services read their config from NATS.
 x-config-file: &config-file "./ftn-ydr.yaml:/sensorkit.yaml:ro"
 x-env-file:    &env-file    "C:/sk/.env:/opt/sk/.env:ro"
 x-data-dir:    &data-dir    "C:/sk/data:/opt/sk/data"
@@ -61,8 +61,6 @@ services:
     command: service run FTN-YDR sensorkit.sensor
     environment:
       <<: *common-env
-    volumes:
-      - *config-file
     restart: unless-stopped
     depends_on:
       config:
@@ -78,7 +76,6 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - *config-file
       - *data-dir
     restart: unless-stopped
     depends_on:
@@ -94,8 +91,6 @@ services:
       <<: *common-env
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    volumes:
-      - *config-file
     restart: unless-stopped
     depends_on:
       config:
@@ -109,7 +104,6 @@ services:
     environment:
       <<: *common-env
     volumes:
-      - *config-file
       - *data-dir
     restart: unless-stopped
     depends_on:
@@ -124,7 +118,6 @@ services:
     environment:
       <<: *common-env
     volumes:
-      - *config-file
       - *env-file
     restart: unless-stopped
     depends_on:
@@ -139,7 +132,6 @@ services:
     environment:
       <<: *common-env
     volumes:
-      - *config-file
       - *env-file
     restart: unless-stopped
     depends_on:
@@ -153,8 +145,6 @@ services:
     command: service run agent sensorkit.auto.agent
     environment:
       <<: *common-env
-    volumes:
-      - *config-file
     restart: unless-stopped
     depends_on:
       config:
@@ -186,7 +176,6 @@ services:
     environment:
       <<: *common-env
     volumes:
-      - *config-file
       - *data-dir
       - "C:/sk/senpai_FTN-YDR.yaml:/opt/sk/senpai_FTN-YDR.yaml:ro"
       - "C:/sk/catalogs:/opt/sk/catalogs:ro"
@@ -205,7 +194,6 @@ services:
     ports:
       - "8200:8200"
     volumes:
-      - *config-file
       - *data-dir
     restart: unless-stopped
     depends_on:
@@ -220,7 +208,6 @@ services:
     environment:
       <<: *common-env
     volumes:
-      - *config-file
       - *env-file
     restart: unless-stopped
     depends_on:
@@ -237,7 +224,6 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - *config-file
       - *data-dir
     restart: unless-stopped
     depends_on:

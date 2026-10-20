@@ -14,9 +14,9 @@ name: sensorkit
 
 x-common-environment: &common-env
   NATS_URL: nats://nats:4222
-  SENSORKIT_CONFIG: /sensorkit.yaml
 #  SENSORKIT_DEBUG: 1
 
+# Only the config loader parses omnisim.yaml; services read their config from NATS.
 x-config-file: &config-file "./omnisim.yaml:/sensorkit.yaml:ro"
 x-env-file:    &env-file    "/path/to/.env:/opt/sk/.env:ro"
 x-data-dir:    &data-dir    "/path/to/data:/opt/sk/data"
@@ -61,8 +61,6 @@ services:
     command: service run OmniSim sensorkit.sensor
     environment:
       <<: *common-env
-    volumes:
-      - *config-file
     restart: unless-stopped
     depends_on:
       config:
@@ -77,8 +75,6 @@ services:
       <<: *common-env
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    volumes:
-      - *config-file
     restart: unless-stopped
     depends_on:
       config:
@@ -95,7 +91,6 @@ services:
     environment:
       <<: *common-env
     volumes:
-      - *config-file
       - *data-dir
       - *env-file
       - "./sdasim_OmniSim.yaml:/opt/sensorkit/deploy/OmniSim/sdasim_OmniSim.yaml:ro"
@@ -113,7 +108,6 @@ services:
     environment:
       <<: *common-env
     volumes:
-      - *config-file
       - *env-file
     restart: unless-stopped
     depends_on:
@@ -140,7 +134,6 @@ services:
     environment:
       <<: *common-env
     volumes:
-      - *config-file
       - *data-dir
       - "./senpai_OmniSim.yaml:/opt/sensorkit/deploy/OmniSim/senpai_OmniSim.yaml:ro"
       - "/path/to/catalogs:/opt/sk/catalogs:ro"
@@ -156,8 +149,6 @@ services:
     command: service run agent sensorkit.auto.agent
     environment:
       <<: *common-env
-    volumes:
-      - *config-file
     restart: unless-stopped
     depends_on:
       config:
@@ -177,7 +168,6 @@ services:
     environment:
       <<: *common-env
     volumes:
-      - *config-file
       - *env-file
     restart: unless-stopped
     depends_on:
@@ -194,7 +184,6 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - *config-file
       - *data-dir
     restart: unless-stopped
     depends_on:
