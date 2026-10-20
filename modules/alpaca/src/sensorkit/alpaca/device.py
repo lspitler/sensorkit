@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 import sensorkit.api as sk
 from alpaca.device import Device
+from sensorkit.common.logging import limited_logger
 
 
 class AlpacaDeviceState(BaseModel):
@@ -79,20 +80,35 @@ class AlpacaDevice:
         """Read a device property, falling back to a default.
 
         Properties the device does not implement resolve to the default quietly.
-        Any other read failure resolves to the default as well, but is logged,
-        since a substituted value can otherwise reach recorded metadata unnoticed.
+        State-related read failures warn at most once per minute for each device,
+        property, and exception type. Other read failures warn on every occurrence.
         """
 
-        from alpaca.exceptions import NotImplementedException
+        from alpaca.exceptions import (
+            InvalidOperationException,
+            NotImplementedException,
+            ValueNotSetException,
+        )
 
         def _read():
             try:
                 return getattr(device, attr)
             except NotImplementedException:
                 return default
+            except (InvalidOperationException, ValueNotSetException) as e:
+                limited_logger(
+                    f"{self.config.protocol}://{self.address}/{self.device_name}/"
+                    f"{self.config.device_number}/{attr}/{type(e).__name__}",
+                    interval=60.0,
+                ).warning(
+                    f"{self.device_name} read of {attr} failed, using {default}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                return default
             except Exception as e:
-                logger.opt(exception=e).warning(
-                    f"{self.device_name} read of {attr} failed, using {default}"
+                logger.warning(
+                    f"{self.device_name} read of {attr} failed, using {default}: "
+                    f"{type(e).__name__}: {e}"
                 )
                 return default
 
