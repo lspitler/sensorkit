@@ -68,7 +68,9 @@ class Call[R: BaseModel | None, V: BaseModel | None = R](Awaitable[V]):
             case "failed":
                 raise RemoteRequestError(reply.reason, details=reply.details)
             case "rejected":
-                raise CallError(f"call rejected: {reply.reason}" if reply.reason else "call rejected")
+                raise CallRejected(
+                    f"call rejected: {reply.reason}" if reply.reason else "call rejected"
+                )
             case state if state != expected:
                 raise CallError(f"unexpected {state} reply")
 
@@ -495,6 +497,10 @@ async def run_long_call[R: BaseModel | None, V: BaseModel | None](
 
 class CallError(Exception):
     """Raised to a caller when a call is rejected or fails."""
+
+
+class CallRejected(CallError):
+    """The remote handler explicitly rejected the call."""
 
 
 class HandlerError(Exception):

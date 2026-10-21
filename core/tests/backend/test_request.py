@@ -8,6 +8,7 @@ from sensorkit.backend.base import RemoteRequestError
 from sensorkit.backend.request import (
     CallContext,
     CallError,
+    CallRejected,
     HandlerError,
     declare_long_request,
     declare_request,
@@ -145,8 +146,10 @@ async def test_simple_call_to_a_long_running_handler(kit):
     await sc.handle_request(request, foo_req)
 
     async with asyncio.timeout(5.0):
-        with pytest.raises(CallError, match="unexpected accepted reply"):
+        with pytest.raises(CallError, match="unexpected accepted reply") as raised:
             await kit.entity(sc.entity).call(mismatched)
+
+        assert not isinstance(raised.value, CallRejected)
 
 
 @pytest.mark.asyncio
@@ -214,12 +217,12 @@ async def test_long_request_rejected(kit):
     async with asyncio.timeout(5.0):
         cli = kit.entity(sc.entity)
 
-        with pytest.raises(CallError, match="call rejected"):
+        with pytest.raises(CallRejected, match="call rejected"):
             await cli.call(request, Message(foo=""))
 
         call = cli.call(request, Message(foo="disk on fire"))
 
-        with pytest.raises(CallError, match="call rejected: disk on fire"):
+        with pytest.raises(CallRejected, match="call rejected: disk on fire"):
             await call.invoke()
 
         assert call.response == Response(val=7)
