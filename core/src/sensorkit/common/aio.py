@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Collection
 from typing import AsyncContextManager, ClassVar, Literal, Self, get_args, overload
 
 from sensorkit.common.logging import limited_logger
@@ -84,6 +84,46 @@ async def defer_cancellation[T](aw: Awaitable[T]) -> T:
         raise asyncio.CancelledError()
 
     return result
+
+
+async def interruptible_wait(
+    futures: Collection[asyncio.Future],
+    *,
+    timeout: float | None = None,
+    interrupt: asyncio.Event | None = None,
+) -> set[asyncio.Future]:
+    """Wait until all futures finish, the timeout expires, or interrupt is set.
+
+    Timeout, interruption, and caller cancellation leave the supplied futures running.
+    Results and exceptions are left for the caller to retrieve.
+
+    Returns:
+        The futures that have not finished.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = None if timeout is None else loop.time() + timeout
+    pending = {future for future in futures if not future.done()}
+    waiter = None if interrupt is None else asyncio.ensure_future(interrupt.wait())
+
+    try:
+        while pending and not (interrupt is not None and interrupt.is_set()):
+            remaining = None if deadline is None else deadline - loop.time()
+
+            if remaining is not None and remaining <= 0:
+                break
+
+            _, pending = await asyncio.wait(
+                pending if waiter is None else {*pending, waiter},
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            pending.discard(waiter)
+    finally:
+        if waiter is not None:
+            waiter.cancel()
+            await asyncio.wait((waiter,))
+
+    return pending
 
 
 @contextlib.asynccontextmanager
@@ -241,18 +281,18 @@ class AsyncObserver[T]:
                         queue.put_nowait(value)
                         self._dropped += 1
 
-                        limited_logger().warning(
-                            f"observer queue full at {queue.maxsize}; dropping the oldest value. "
-                            "A subscriber is not keeping up, or leaked without unsubscribing."
-                        )
+                        # A single-value queue keeps only the latest value by design.
+                        if queue.maxsize > 1:
+                            limited_logger().warning(
+                                f"observer queue full at {queue.maxsize}; dropping oldest value"
+                            )
                     case "close":
                         del self._observers[queue]
                         self._dropped += queue.qsize() + 1
                         queue.shutdown(immediate=True)
 
                         limited_logger().warning(
-                            f"observer queue full at {queue.maxsize}; closing the subscriber. "
-                            "It is not keeping up, or leaked without unsubscribing."
+                            f"observer queue full at {queue.maxsize}; closing subscriber"
                         )
 
     def close(self):

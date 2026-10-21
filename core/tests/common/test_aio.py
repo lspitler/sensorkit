@@ -4,7 +4,13 @@ import gc
 
 import pytest
 
-from sensorkit.common.aio import AsyncLoop, AsyncObserver, AsyncValueLatch, defer_cancellation
+from sensorkit.common.aio import (
+    AsyncLoop,
+    AsyncObserver,
+    AsyncValueLatch,
+    defer_cancellation,
+    interruptible_wait,
+)
 
 
 async def released_operation(started: asyncio.Event, release: asyncio.Event, error=None):
@@ -99,6 +105,87 @@ async def test_defer_cancellation_propagates_operation_cancellation():
             await caller
 
     assert operation.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_interruptible_wait_leaves_results_to_caller():
+    loop = asyncio.get_running_loop()
+    succeeded = loop.create_future()
+    failed = loop.create_future()
+    canceled = loop.create_future()
+    loop.call_soon(succeeded.set_result, "done")
+    loop.call_soon(failed.set_exception, ValueError("operation failed"))
+    loop.call_soon(canceled.cancel)
+
+    async with asyncio.timeout(1):
+        assert await interruptible_wait((succeeded, failed, canceled)) == set()
+
+    assert succeeded.result() == "done"
+
+    with pytest.raises(ValueError, match="operation failed"):
+        failed.result()
+
+    assert canceled.cancelled()
+    assert await interruptible_wait(()) == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_set", [False, True])
+async def test_interruptible_wait_preserves_work_on_interrupt(already_set):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    interrupt = asyncio.Event()
+    operation = asyncio.create_task(released_operation(started, release))
+
+    if already_set:
+        interrupt.set()
+
+    caller = asyncio.create_task(interruptible_wait((operation,), interrupt=interrupt))
+    await started.wait()
+    await asyncio.sleep(0)
+    interrupt.set()
+
+    async with asyncio.timeout(1):
+        assert await caller == {operation}
+
+    assert not operation.done()
+    release.set()
+    assert await operation == "done"
+
+
+@pytest.mark.asyncio
+async def test_interruptible_wait_preserves_work_on_timeout():
+    started = asyncio.Event()
+    release = asyncio.Event()
+    operation = asyncio.create_task(released_operation(started, release))
+
+    async with asyncio.timeout(1):
+        assert await interruptible_wait((operation,), timeout=0.01) == {operation}
+
+    assert not operation.done()
+    release.set()
+    assert await operation == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_interrupt", [False, True])
+async def test_interruptible_wait_preserves_work_on_caller_cancellation(with_interrupt):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    interrupt = asyncio.Event() if with_interrupt else None
+    operation = asyncio.create_task(released_operation(started, release))
+    caller = asyncio.create_task(interruptible_wait((operation,), interrupt=interrupt))
+    await started.wait()
+    await asyncio.sleep(0)
+    caller.cancel()
+
+    async with asyncio.timeout(1):
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+    assert not operation.done()
+    release.set()
+    assert await operation == "done"
 
 
 @pytest.mark.asyncio
@@ -324,6 +411,20 @@ async def test_async_observer_drops_oldest_when_full():
     # A dropped value must not be left outstanding, which would strand join() forever.
     async with asyncio.timeout(1):
         await queue.join()
+
+
+@pytest.mark.asyncio
+async def test_async_observer_single_value_queue_keeps_latest():
+    obs = AsyncObserver(0)
+    queue = obs.subscribe(initial_value=True, maxsize=1)
+
+    for value in (1, 2, 3):
+        obs.notify(value)
+
+    # Replacement is intended, but still counted.
+    assert obs.dropped == 3
+    assert queue.get_nowait() == 3
+    assert queue.empty()
 
 
 @pytest.mark.asyncio
