@@ -154,6 +154,7 @@ class EntityClient(EntityBase):
         super().__init__(sensorkit, entity)
         self._online_monitor: asyncio.Task | None = None
         self._online_observer = AsyncObserver(False)
+        self._event_mux = EventStreamConsumer(self._stream)
 
     async def _monitor_online_state(self):
         stream = await self._kv.monitor("EntityLease")
@@ -172,12 +173,21 @@ class EntityClient(EntityBase):
 
         return self._online_observer.consume(initial_value=True)
 
-    @functools.cache
     def get_event_mux(self) -> EventMultiplexer:
         """Return the shared event consumer object for this entity."""
-        ec = EventStreamConsumer(self._stream)
-        self._ec_startup = asyncio.create_task(ec.start())
-        return ec
+        return self._event_mux
+
+    async def subscribe_events(self):
+        """Wait until the entity's shared event subscription is live, starting it if needed.
+
+        Once this returns, `monitor_event_nowait` and long-running calls attach to the entity's
+        events without suspending, so no event published after attaching is missed. The
+        subscription stays live for the life of the client.
+
+        Raises:
+            BackendError: If the subscription failed to start.
+        """
+        await self._event_mux.wait_ready()
 
     @staticmethod
     async def _monitor_receive[M: Event](queue: asyncio.Queue[M], context: contextlib.ExitStack):
@@ -189,14 +199,14 @@ class EntityClient(EntityBase):
     async def _await_event_consumer(self, context: contextlib.ExitStack):
         """Wait until the entity's event subscription is live, releasing the queue on failure."""
         try:
-            await self._ec_startup
+            await self._event_mux.wait_ready()
         except BaseException:
             context.close()
             raise
 
     async def monitor_event[M: Event](self, event_type: type[M]):
         """Return an async generator yielding events of the specified type from the entity's stream."""
-        consumer = self.get_event_mux()
+        consumer = self._event_mux
         context = contextlib.ExitStack()
         queue: asyncio.Queue[M] = context.enter_context(consumer.event_queue(event_type))
 
@@ -204,9 +214,26 @@ class EntityClient(EntityBase):
 
         return self._monitor_receive(queue, context)
 
+    def monitor_event_nowait[M: Event](self, event_type: type[M]):
+        """Return an async generator yielding events of the specified type from the entity's stream.
+
+        Attaches without suspending, so the caller misses no event published after this returns.
+
+        Raises:
+            EventsNotSubscribed: If `subscribe_events` has not completed.
+            BackendError: If the subscription failed to start.
+        """
+        if not self._event_mux.ready():
+            raise EventsNotSubscribed(f"{self.entity} events are not subscribed")
+
+        context = contextlib.ExitStack()
+        queue: asyncio.Queue[M] = context.enter_context(self._event_mux.event_queue(event_type))
+
+        return self._monitor_receive(queue, context)
+
     async def monitor_all_events(self):
         """Return an async generator yielding all events from the entity's stream."""
-        consumer = self.get_event_mux()
+        consumer = self._event_mux
         context = contextlib.ExitStack()
         queue = context.enter_context(consumer.all_events())
 
@@ -293,10 +320,14 @@ class EntityClient(EntityBase):
                     request_coro,
                     request.response,
                     request.result,
-                    self.get_event_mux(),
+                    self._event_mux,
                 )
             case _:
                 return Call(request_coro, request.response)
+
+
+class EventsNotSubscribed(Exception):
+    """Raised when attaching to an entity's events without suspending before they are subscribed."""
 
 
 class EntityRef[T: EntityClient = EntityClient]:

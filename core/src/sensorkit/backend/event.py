@@ -9,9 +9,10 @@ from typing import TYPE_CHECKING, ClassVar, override
 
 import uuid_utils.compat as uuid
 from loguru import logger
-from pydantic import Field, ValidationError
+from pydantic import Field
 
 from sensorkit.backend.base import SpecialProperty
+from sensorkit.common.aio import cleanup_future
 from sensorkit.common.model import ModelRegistry, RegistryBaseModel
 
 if TYPE_CHECKING:
@@ -49,6 +50,10 @@ class EventMultiplexer:
     def __init__(self):
         self._all_queues: set[asyncio.Queue[Event]] = set()
         self._single_queues: dict[str, set[asyncio.Queue[Event]]] = collections.defaultdict(set)
+
+    def ready(self) -> bool:
+        """Return whether events are being received. A plain multiplexer has no source to wait for."""
+        return True
 
     async def wait_ready(self):
         """Wait until events are being received. A plain multiplexer has no source to wait for."""
@@ -98,33 +103,50 @@ class EventStreamConsumer(EventMultiplexer):
     def __init__(self, context: StreamContext):
         super().__init__()
         self._context = context
-        self._startup = asyncio.get_running_loop().create_future()
+        self._startup: asyncio.Future[None] | None = None
+        self._task: asyncio.Task[None] | None = None
 
-    async def start(self):
-        """Start the background event consumer task and wait until the stream is ready."""
-        self._task = asyncio.create_task(self._event_consumer_task())
-        await self._startup
+    @override
+    def ready(self):
+        """Return whether the stream subscription is live.
+
+        Raises:
+            Exception: If the subscription failed to start.
+        """
+        if self._startup is None or not self._startup.done():
+            return False
+
+        # Raise the startup error, if any.
+        self._startup.result()
+        return True
 
     @override
     async def wait_ready(self):
-        """Wait until the stream subscription is live, raising if it failed to start.
+        """Wait until the stream subscription is live, starting it on first use.
 
-        Blocks indefinitely until `start` is called, so callers must hold a multiplexer that is
-        already starting.
+        Returns without suspending once the subscription is live. Cancelling the wait leaves
+        startup running for other waiters.
+
+        Raises:
+            Exception: If the subscription failed to start.
         """
-        await self._startup
+        if self._startup is None:
+            self._startup = asyncio.get_running_loop().create_future()
+            self._task = asyncio.create_task(self._event_consumer_task(self._startup))
+            self._task.add_done_callback(cleanup_future)
 
-    async def _event_consumer_task(self):
+        await asyncio.shield(self._startup)
+
+    async def _event_consumer_task(self, startup: asyncio.Future[None]):
         try:
             stream = await self._context.consume(SpecialProperty.EVENTS)
         except BaseException as e:
-            self._startup.set_exception(e)
+            startup.set_exception(e)
             raise
         else:
-            self._startup.set_result(None)
+            startup.set_result(None)
 
         async for msg in stream:
-            try:
+            # A bad event must not stop delivery of the events behind it. Parsing logs the error.
+            with contextlib.suppress(Exception):
                 await self.parse_event(msg.data)
-            except ValidationError:
-                logger.exception("Event validation failed")

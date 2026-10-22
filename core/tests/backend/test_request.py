@@ -5,6 +5,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from sensorkit.backend.base import RemoteRequestError
+from sensorkit.backend.fake import FakeBackendImpl
 from sensorkit.backend.request import (
     CallContext,
     CallError,
@@ -428,6 +429,42 @@ async def test_long_requests_matched_by_call_id(kit):
 
         releases["a"].set()
         assert (await first).val == 1
+
+
+@pytest.mark.asyncio
+async def test_long_request_sends_before_suspending(kit):
+    """A long-running call on subscribed events is sent before its caller first suspends."""
+    if isinstance(kit.backend.impl, FakeBackendImpl):
+        pytest.skip("the in-memory backend retracts a request when its caller is cancelled")
+
+    async with asyncio.timeout(1.0):
+        sc = await kit.register_service("testservice", "0.1.0")
+
+    request = declare_long_request(name="foo", result=Result)
+    received = asyncio.Event()
+
+    async def foo_req(msg: None, call: CallContext[Result]):
+        received.set()
+        call.accept()
+        await call.succeed(result=Result(val=1))
+
+    await sc.handle_request(request, foo_req)
+    cli = kit.entity(sc.entity)
+
+    async with asyncio.timeout(1.0):
+        await cli.subscribe_events()
+
+    async def send():
+        # The cancellation lands at the caller's first suspension.
+        asyncio.get_running_loop().call_soon(asyncio.current_task().cancel)
+        await cli.call(request)
+
+    caller = asyncio.create_task(send())
+    await asyncio.wait({caller})
+    assert caller.cancelled()
+
+    async with asyncio.timeout(1.0):
+        await received.wait()
 
 
 @pytest.mark.asyncio

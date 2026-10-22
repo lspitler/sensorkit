@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import asyncio
+import json
+
 import pytest
 import pytest_asyncio
-from pydantic import ValidationError
+from pydantic import ValidationError, model_validator
 
 from sensorkit.backend.base import KVError
 from sensorkit.backend.event import Event, EventMultiplexer, UnknownEvent
@@ -20,6 +23,14 @@ class SampleEvent2(Event):
 
 class SampleEvent3(Event):
     flag: bool
+
+
+class PoisonEvent(Event):
+    """An event whose validation raises an error that is not a validation error."""
+
+    @model_validator(mode="after")
+    def poison(self):
+        raise RuntimeError("poison")
 
 
 class SampleState(EventSourcedState):
@@ -98,6 +109,19 @@ async def test_event_multiplexer_all_events():
 
         assert received1 == event1
         assert received2 == event2
+
+
+@pytest.mark.asyncio
+async def test_event_consumer_survives_bad_event(kit, entity_impl, emitted):
+    """An event that fails to parse does not stop delivery of the events behind it."""
+    poison = json.dumps({"event_model": PoisonEvent.model_tag()}).encode()
+    event = SampleEvent1(value=1)
+
+    await kit.backend.stream(entity_impl.entity).publish_event(poison)
+    await entity_impl.emit_event(event)
+
+    async with asyncio.timeout(1.0):
+        assert await anext(emitted) == event
 
 
 @pytest.mark.asyncio

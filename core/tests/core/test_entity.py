@@ -17,6 +17,7 @@ from sensorkit.core.entity import (
     EntityDetails,
     EntityInfo,
     EntityRef,
+    EventsNotSubscribed,
 )
 from sensorkit.core.impl.controller import ControllerImpl
 from sensorkit.core.impl.device import DeviceImpl
@@ -322,6 +323,51 @@ async def test_entity_event(kit):
 
         await ent.emit_event(MyEvent(my_key="foobar"))
         await done.wait()
+
+
+class PingEvent(Event):
+    value: int
+
+
+@pytest.mark.asyncio
+async def test_entity_event_nowait(kit, entity_impl):
+    """Events are attached without suspending once subscribed."""
+    cli = kit.entity(entity_impl.entity)
+
+    async with asyncio.timeout(1.0):
+        await cli.subscribe_events()
+
+    event = PingEvent(value=1)
+
+    async with contextlib.aclosing(cli.monitor_event_nowait(PingEvent)) as events:
+        await entity_impl.emit_event(event)
+
+        async with asyncio.timeout(1.0):
+            assert await anext(events) == event
+
+
+@pytest.mark.asyncio
+async def test_entity_event_nowait_requires_subscription(kit, entity_impl):
+    cli = kit.entity(entity_impl.entity)
+
+    with pytest.raises(EventsNotSubscribed):
+        cli.monitor_event_nowait(PingEvent)
+
+
+@pytest.mark.asyncio
+async def test_entity_event_subscription_outlives_cancelled_waiter(kit, entity_impl):
+    """Cancelling one waiter leaves the shared subscription starting for the others."""
+    cli = kit.entity(entity_impl.entity)
+    waiter = asyncio.create_task(cli.subscribe_events())
+
+    # Let the waiter start the subscription, then cancel it before startup completes.
+    await asyncio.sleep(0)
+    waiter.cancel()
+    await asyncio.wait({waiter})
+    assert waiter.cancelled()
+
+    async with asyncio.timeout(1.0):
+        await cli.subscribe_events()
 
 
 @pytest.mark.asyncio
