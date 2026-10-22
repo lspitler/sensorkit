@@ -584,21 +584,11 @@ class ControllerImpl(EntityImpl, ControllerInterface):
             with self.enter_context():
                 logger.warning(f"Execution of {task.task_type} task cancelled")
 
-            try:
-                await call.fail()
-            except Exception as e:
-                logger.warning(f"Error logging cancelled task event ({type(e).__name__})")
-
             raise
         except Exception as e:
             with self.enter_context():
                 logger.error(f"Error executing {task.task_type} task")
                 logger.opt(exception=e).debug(f"{task.task_type} ({execution.task_id}) failed")
-
-            try:
-                await call.fail()
-            except Exception:
-                logger.warning(f"Error logging failed task event ({type(e).__name__})")
         else:
             with self.enter_context():
                 logger.info(f"Finished {task.task_type} task")
@@ -614,6 +604,17 @@ class ControllerImpl(EntityImpl, ControllerInterface):
             finally:
                 if self._execution is running:
                     self._execution = None
+
+                # Clients treat the final event as proof the run ended, so it follows the join.
+                if not call.finalized:
+                    await defer_cancellation(self._fail_call(call, task))
+
+    @staticmethod
+    async def _fail_call(call: CallContext, task: Task):
+        try:
+            await call.fail()
+        except Exception as e:
+            logger.warning(f"Error reporting failed {task.task_type} task ({type(e).__name__})")
 
     async def _run_execution(
         self,

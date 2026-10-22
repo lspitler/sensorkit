@@ -318,6 +318,7 @@ class CallContext[V: BaseModel | None, R: BaseModel | None = None]:
         self._stream = stream
         self.reply: asyncio.Future[CallReply[R]] = asyncio.get_running_loop().create_future()
         self.finalized = False
+        """Whether the call ended by rejection or a published end event."""
 
     @property
     def responded(self) -> bool:
@@ -405,9 +406,12 @@ class CallContext[V: BaseModel | None, R: BaseModel | None = None]:
         if self.finalized:
             raise HandlerError("Call has already been finalized")
 
-        self.finalized = finalize
-
         await self._stream.publish_event(event.model_dump_json().encode())
+
+        # An unpublished end event leaves the call open for another. One that failed may still have
+        # been delivered, so callers act on the first end event they receive.
+        if finalize:
+            self.finalized = True
 
 
 _pending_failures: set[asyncio.Task] = set()

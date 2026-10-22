@@ -66,9 +66,18 @@ class GatedBackendImpl(FakeBackendImpl):
         super().__init__()
         self.faults: list[PublishFault] = []
 
-    def arm(self, match: Callable[[dict[str, Any]], bool], *, fail=False) -> PublishFault:
-        """Block or fail the next matching publication."""
+    def arm(
+        self, match: Callable[[dict[str, Any]], bool], *, fail=False, hold=False
+    ) -> PublishFault:
+        """Block or fail the next matching publication.
+
+        A failure is immediate unless held, in which case it waits for release.
+        """
         fault = PublishFault(match, fail)
+
+        if fail and not hold:
+            fault.release.set()
+
         self.faults.append(fault)
         return fault
 
@@ -93,11 +102,10 @@ class GatedBackendImpl(FakeBackendImpl):
     async def stream_publish(self, target: Subject, payload: bytes):
         if fault := self.take_fault(payload):
             fault.reached.set()
+            await fault.release.wait()
 
             if fault.fail:
                 raise BackendError("injected publication failure")
-
-            await fault.release.wait()
 
         await super().stream_publish(target, payload)
 
@@ -128,6 +136,10 @@ def entering_transition(data: dict[str, Any]) -> bool:
 
 def succeeding_call(data: dict[str, Any]) -> bool:
     return data.get("call_state") == "success"
+
+
+def reporting_progress(data: dict[str, Any]) -> bool:
+    return data.get("call_state") == "running"
 
 
 def reporting(state: InternalControllerState) -> Callable[[dict[str, Any]], bool]:
@@ -946,6 +958,64 @@ async def test_failed_final_publication_fails_request(gated_kit, gated_backend):
     assert stale.execution_state.executing
     assert reported.operating_state.current == STANDBY
     assert reported.operating_state.target is None
+
+
+@pytest.mark.asyncio
+async def test_failed_success_publication_fails_request(gated_kit, gated_backend):
+    async with asyncio.timeout(1.0):
+        sc = await gated_kit.register_service("testservice", "0.1.0")
+        controller = await sc.register_controller("mycontroller")
+
+    @controller.task_handler(InitTask)
+    async def run_init(_: InitTask):
+        pass
+
+    async with asyncio.timeout(1.0):
+        cli = gated_kit.controller("mycontroller")
+        gated_backend.arm(succeeding_call, fail=True)
+
+        # The call ends without waiting out its progress deadline.
+        with pytest.raises(CallError):
+            await cli.execute_task(InitTask())
+
+
+@pytest.mark.asyncio
+async def test_failed_progress_publication_fails_request_after_run_ends(gated_kit, gated_backend):
+    async with asyncio.timeout(1.0):
+        sc = await gated_kit.register_service("testservice", "0.1.0")
+        controller = await sc.register_controller("mycontroller")
+
+    started = asyncio.Event()
+    stopping = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    @controller.task_handler(InitTask)
+    async def run_init(_: InitTask):
+        started.set()
+
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopping.set()
+            await cleaned.wait()
+
+    async with asyncio.timeout(1.0):
+        cli = gated_kit.controller("mycontroller")
+        fault = gated_backend.arm(reporting_progress, fail=True, hold=True)
+        exec_call = asyncio.ensure_future(cli.execute_task(InitTask()).run_to_completion())
+
+        await started.wait()
+        fault.release.set()
+        await stopping.wait()
+
+        # The request stays open while the cancelled run cleans up.
+        done, _ = await asyncio.wait((exec_call,), timeout=0.1)
+        assert not done
+
+        cleaned.set()
+
+        with pytest.raises(CallError):
+            await exec_call
 
 
 @pytest.mark.asyncio
