@@ -678,10 +678,11 @@ async def test_startup_recovers_interrupted_transition(
 
 
 @pytest.mark.asyncio
-async def test_startup_keeps_settled_state(kit):
+@pytest.mark.parametrize("settled", [OPERATE, STANDBY, SHUTDOWN, ERROR])
+async def test_startup_reports_settled_state_unknown(kit, settled):
     cli = kit.controller("mycontroller")
     seeded = seeded_state(
-        ControllerOperatingState(current=SHUTDOWN, previous=TRANSITION, context=KeywordDict()),
+        ControllerOperatingState(current=settled, previous=TRANSITION, context=KeywordDict()),
         TaskExecutionState(finished=TaskFinishInfo(), execution=seeded_execution()),
     )
 
@@ -692,7 +693,60 @@ async def test_startup_keeps_settled_state(kit):
         await sc.register_controller("mycontroller")
         state = await cli.kv_get_model(ControllerState)
 
-    assert state.model_dump() == seeded.model_dump()
+    assert state.operating_state.current == UNKNOWN
+    assert state.operating_state.previous == settled
+    assert state.operating_state.target is None
+    assert state.execution_state.model_dump() == seeded.execution_state.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_startup_aborts_interrupted_task(kit):
+    cli = kit.controller("mycontroller")
+    execution = TaskExecution(
+        task=CollectTask(), task_id=uuid.uuid7(), controller_id="mycontroller"
+    )
+
+    await cli.kv_put_model(
+        seeded_state(
+            ControllerOperatingState(current=OPERATE, context=KeywordDict()),
+            TaskExecutionState(executing=True, execution=execution),
+        )
+    )
+
+    async with asyncio.timeout(1.0):
+        sc = await kit.register_service("testservice", "0.1.0")
+        await sc.register_controller("mycontroller")
+        state = await cli.kv_get_model(ControllerState)
+
+    assert state.operating_state.current == UNKNOWN
+    assert is_finished(state, execution.task_id)
+    assert state.execution_state.finished.aborted
+
+
+@pytest.mark.asyncio
+async def test_attach_hook_reports_determined_state(kit):
+    cli = kit.controller("mycontroller")
+
+    await cli.kv_put_model(
+        seeded_state(
+            ControllerOperatingState(current=SHUTDOWN, context=KeywordDict()),
+            TaskExecutionState(execution=None),
+        )
+    )
+
+    async with asyncio.timeout(1.0):
+        sc = await kit.register_service("testservice", "0.1.0")
+        impl = ControllerImpl.for_service_context(sc, "mycontroller")
+
+        @impl.on_attach
+        async def determine():
+            await impl.set_internal_state(OPERATE)
+
+        await sc.register_impl(impl)
+        state = await cli.kv_get_model(ControllerState)
+
+    assert state.operating_state.current == OPERATE
+    assert state.operating_state.previous == UNKNOWN
 
 
 @pytest.mark.asyncio

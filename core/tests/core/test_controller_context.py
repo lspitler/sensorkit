@@ -392,7 +392,7 @@ async def test_startup_retains_interrupted_input(kit, controller_service):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["empty", "nested"])
-async def test_startup_keeps_settled_input(kit, controller_service, kind):
+async def test_startup_retains_settled_input(kit, controller_service, kind):
     cli = kit.controller("mycontroller")
     seeded = ControllerState(
         enable_state=ControllerEnableState(enabled=True),
@@ -410,9 +410,9 @@ async def test_startup_keeps_settled_input(kit, controller_service, kind):
         await controller_service.register_controller("mycontroller")
         state = await cli.kv_get_model(ControllerState)
 
-    assert state.operating_state.current == SHUTDOWN
+    assert state.operating_state.current == UNKNOWN
+    assert state.operating_state.previous == SHUTDOWN
     assert state.operating_state.context == lifecycle_input(kind)
-    assert state.model_dump() == seeded.model_dump()
 
 
 @pytest.mark.asyncio
@@ -421,7 +421,7 @@ async def test_startup_keeps_settled_input(kit, controller_service, kind):
     ("operating", "executing", "expected", "previous"),
     [
         ({"current": "operate"}, False, UNKNOWN, OPERATE),
-        ({"current": "error", "previous": "transition"}, False, ERROR, TRANSITION),
+        ({"current": "error", "previous": "transition"}, False, UNKNOWN, ERROR),
         ({"current": "operate", "target": "shutdown"}, True, UNKNOWN, OPERATE),
     ],
     ids=("achieved", "error", "interrupted"),

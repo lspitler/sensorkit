@@ -219,7 +219,11 @@ def _receive_task[T: Task](callback: TaskHandlerCallback[T]) -> ExecutionHandler
 
 
 class ControllerImpl(EntityImpl, ControllerInterface):
-    """Helper for implementing server-side functionality of a Controller."""
+    """Helper for implementing server-side functionality of a Controller.
+
+    A controller reports UNKNOWN when its service starts. Attach hooks that can determine the
+    hardware state report it with `set_internal_state`.
+    """
 
     current: ClassVar[ContextVar[ControllerImpl | None]] = ContextVar("current_controller", default=None)
 
@@ -265,35 +269,37 @@ class ControllerImpl(EntityImpl, ControllerInterface):
             operating = self._state.operating_state
             current = self._state.execution_state
 
-            # A pending target also identifies an interrupted lifecycle execution.
-            interrupted = (
-                operating.current == InternalControllerState.TRANSITION
-                or operating.target is not None
-            )
-
             # Persist legacy normalization before accepting work.
             legacy = "context" not in operating.model_fields_set
 
-            if not interrupted and not legacy:
+            if (
+                operating.current == InternalControllerState.UNKNOWN
+                and operating.target is None
+                and not legacy
+                and not current.executing
+            ):
                 return
 
             events = []
-            settled = operating.NO_CHANGE
 
-            if interrupted:
+            # A pending target also identifies an interrupted lifecycle execution.
+            if (
+                operating.current == InternalControllerState.TRANSITION
+                or operating.target is not None
+            ):
                 logger.warning(f"Recovering from interrupted transition to {operating.target}")
-                settled = InternalControllerState.UNKNOWN
 
-                if current.executing:
-                    events.append(
-                        TaskExecutionState(
-                            finished=TaskFinishInfo(aborted=True),
-                            execution=current.execution,
-                            context=current.context,
-                        )
+            if current.executing:
+                events.append(
+                    TaskExecutionState(
+                        finished=TaskFinishInfo(aborted=True),
+                        execution=current.execution,
+                        context=current.context,
                     )
+                )
 
-            events.append(operating.derive(current=settled, target=None))
+            # The persisted state describes hardware before the restart.
+            events.append(operating.derive(current=InternalControllerState.UNKNOWN, target=None))
             await update(*events)
 
     @override
