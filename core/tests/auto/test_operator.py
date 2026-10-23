@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """System tests for VirtualOperator driving election, demand, and lifecycle.
 
-Tests the agent layer: VirtualOperator with election, demand evaluation,
-program discovery, and lifecycle management.
+Cover state election, demand evaluation, program discovery, and lifecycle management.
 """
 
 from __future__ import annotations
@@ -10,8 +9,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
+from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
 
 from sensorkit.astro.common import SitePosition
 from sensorkit.auto.agent import (
@@ -21,19 +23,112 @@ from sensorkit.auto.agent import (
     AgentState,
 )
 from sensorkit.auto.constraint import GenericConstraint
-from sensorkit.auto.operator import ControllerConfig, VirtualOperator
-from sensorkit.auto.scheduler import ProgramConfig
+from sensorkit.auto.lifecycle import ControllerLifecycle
+from sensorkit.auto.mode import Mode
+from sensorkit.auto.operator import (
+    ControllerConfig,
+    ControllerDriver,
+    ProgramStateManager,
+    VirtualOperator,
+)
+from sensorkit.auto.scheduler import ProgramConfig, ScheduleIntent, ScheduleInterval
 from sensorkit.backend.base import Entity
 from sensorkit.common.condition import EqualsCondition
-from sensorkit.core.controller import InternalControllerState
+from sensorkit.core.controller import ControllerState, InternalControllerState
 from sensorkit.core.program import ProgramDiscovery, ProgramState
 from sensorkit.core.task import InitTask, ShutdownTask
 
 _test_position = SitePosition(latitude_degrees=42.0, longitude_degrees=123.0, altitude_km=3.0)
 
 
+async def reports(kit, state: InternalControllerState) -> bool:
+    """Return whether ctrl1 reports the requested state with no transition pending."""
+    operating = (await kit.controller("ctrl1").kv_get_model(ControllerState)).operating_state
+    return operating.current == state and operating.target is None
+
+
+@pytest.mark.parametrize("delay", [-1.0, math.inf, math.nan])
+def test_invalid_external_change_delay_is_rejected(delay):
+    with pytest.raises(ValidationError):
+        ControllerConfig(external_change_delay=delay)
+
+    with pytest.raises(ValueError):
+        ControllerLifecycle(external_change_delay=delay)
+
+
+@pytest.mark.parametrize("delay", [None, 0.0, 2.5])
+def test_external_change_delay_reaches_lifecycle(delay):
+    config = ControllerConfig() if delay is None else ControllerConfig(external_change_delay=delay)
+    config.name = "ctrl1"
+    driver = ControllerDriver(config, ProgramDiscovery(), ProgramStateManager([]))
+
+    assert driver.lifecycle.external_change_delay == (30.0 if delay is None else delay)
+
+
 @pytest.mark.asyncio
-async def test_operator_override_drives_operate(kit, service_context):
+async def test_program_interrupt_policy_reaches_pending_init(kit, service_context):
+    """The driver forwards program interruption policy without aborting a pending init task."""
+    controller = await service_context.register_controller("ctrl1")
+    await controller.kv_put_model(_test_position)
+    program = await service_context.register_program("prog1")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+    tasking = asyncio.Event()
+
+    @controller.task_handler(InitTask)
+    async def init(task):
+        entered.set()
+
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    @program.task_factory
+    async def factory():
+        tasking.set()
+        return None
+
+    await kit.controller("ctrl1").enable()
+    await kit.program("prog1").enable("ctrl1")
+    config = ControllerConfig(
+        modes=[Mode(name="observing")],
+        tasking=[ProgramConfig(program="prog1", interrupt=True)],
+    )
+    config.name = "ctrl1"
+    driver = ControllerDriver(config, ProgramDiscovery(), ProgramStateManager(["prog1"]))
+    await driver.start(kit)
+    now = datetime.now(UTC)
+    driver.scheduler.intervals.add(
+        ScheduleInterval(
+            now - timedelta(minutes=1),
+            now + timedelta(minutes=1),
+            ScheduleIntent("observing", ("prog1",)),
+        )
+    )
+
+    try:
+        async with asyncio.timeout(5.0):
+            driver.lifecycle.enable()
+            driver.set_demand(True)
+            await entered.wait()
+            assert not driver.set_demand(True)
+            await asyncio.sleep(0)
+            assert driver.lifecycle.demand_state.program_interrupt
+            assert not cancelled.is_set()
+            release.set()
+            await tasking.wait()
+    finally:
+        release.set()
+
+        async with asyncio.timeout(10.0):
+            await driver.stop()
+
+
+@pytest.mark.asyncio
+async def test_operator_override_drives_operate(kit, service_context, until):
     """Override vote=True drives lifecycle to OPERATE and runs InitTask."""
     init_ran = asyncio.Event()
 
@@ -72,23 +167,20 @@ async def test_operator_override_drives_operate(kit, service_context):
     )
 
     try:
-        driver = operator.drivers["ctrl1"]
-
         # The operator loop runs every 2 seconds. Wait for init to run, then verify the lifecycle
         # reached OPERATE.
         async with asyncio.timeout(10.0):
             await state.apply_to_operator(operator, {"ctrl1": config})
             await init_ran.wait()
 
-            while driver.lifecycle.belief_state != InternalControllerState.OPERATE:
-                await asyncio.sleep(0.05)
+            await until(lambda: reports(kit, InternalControllerState.OPERATE), timeout=10.0)
     finally:
         async with asyncio.timeout(10.0):
             await operator.stop()
 
 
 @pytest.mark.asyncio
-async def test_operator_override_false_shuts_down(kit, service_context):
+async def test_operator_override_false_shuts_down(kit, service_context, until):
     """Override vote=False drives lifecycle to SHUTDOWN after OPERATE."""
     init_ran = asyncio.Event()
     shutdown_ran = asyncio.Event()
@@ -151,21 +243,18 @@ async def test_operator_override_false_shuts_down(kit, service_context):
             scheduler_state=AgentSchedulerState(scheduling_enabled=False),
         )
 
-        driver = operator.drivers["ctrl1"]
-
         async with asyncio.timeout(15.0):
             await state.apply_to_operator(operator, {"ctrl1": config})
             await shutdown_ran.wait()
 
-            while driver.lifecycle.belief_state != InternalControllerState.SHUTDOWN:
-                await asyncio.sleep(0.05)
+            await until(lambda: reports(kit, InternalControllerState.SHUTDOWN), timeout=10.0)
     finally:
         async with asyncio.timeout(10.0):
             await operator.stop()
 
 
 @pytest.mark.asyncio
-async def test_active_constraint_aborts_running_task(kit, backend, service_context):
+async def test_active_constraint_aborts_running_task(kit, backend, service_context, until):
     """A constraint going active aborts the running task instead of waiting for it to finish."""
     init_started = asyncio.Event()
     init_aborted = asyncio.Event()
@@ -245,11 +334,7 @@ async def test_active_constraint_aborts_running_task(kit, backend, service_conte
 
         async with asyncio.timeout(20.0):
             await init_aborted.wait()
-
-            driver = operator.drivers["ctrl1"]
-
-            while driver.lifecycle.belief_state != InternalControllerState.SHUTDOWN:
-                await asyncio.sleep(0.05)
+            await until(lambda: reports(kit, InternalControllerState.SHUTDOWN), timeout=10.0)
     finally:
         clear_weather.cancel()
 

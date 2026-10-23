@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""System tests for ControllerLifecycle driving the full tasking flow.
+"""System tests for controller lifecycle transitions and program tasking.
 
-Tests the critical path: service registration → lifecycle enable →
-InitTask → program start_tasking → TaskingLoop → task execution →
-stop/shutdown. All tests run on the fake backend.
+Cover service registration, lifecycle enablement, initialization, program tasking,
+and shutdown using the fake backend.
 """
 
 from __future__ import annotations
@@ -14,16 +13,23 @@ import uuid
 
 import pytest
 
-from sensorkit.auto.lifecycle import ControllerLifecycle, DemandProc, LifecycleStep
+from sensorkit.auto.lifecycle import ControllerLifecycle, LifecycleStep
+from sensorkit.auto.procedures import StandbyProcedure
 from sensorkit.backend.request import CallError
 from sensorkit.core.client import SensorKit
-from sensorkit.core.controller import InternalControllerState
+from sensorkit.core.controller import ControllerState, InternalControllerState
 from sensorkit.core.task import (
     CollectTask,
     InitTask,
     ShutdownTask,
     StandbyTask,
 )
+
+
+async def reports(kit, state: InternalControllerState) -> bool:
+    """Return whether ctrl1 reports the requested state with no transition pending."""
+    operating = (await kit.controller("ctrl1").kv_get_model(ControllerState)).operating_state
+    return operating.current == state and operating.target is None
 
 
 async def cleanup(lifecycle: ControllerLifecycle, sc):
@@ -35,8 +41,8 @@ async def cleanup(lifecycle: ControllerLifecycle, sc):
 
 
 @pytest.mark.asyncio
-async def test_operate_full_cycle(kit):
-    """Lifecycle drives OPERATE → init → tasking → task execution → SHUTDOWN."""
+async def test_operate_full_cycle(kit, until):
+    """OPERATE demand initializes the controller and starts tasking before SHUTDOWN demand."""
     sc = await kit.register_service("ctrl-svc", "0.1.0")
     controller = await sc.register_controller("ctrl1")
     program = await sc.register_program("prog1")
@@ -84,9 +90,7 @@ async def test_operate_full_cycle(kit):
 
     async with asyncio.timeout(15.0):
         await shutdown_ran.wait()
-        # Wait for lifecycle to process the task completion and update belief state.
-        while lifecycle.belief_state != InternalControllerState.SHUTDOWN:
-            await asyncio.sleep(0.05)
+        await until(lambda: reports(kit, InternalControllerState.SHUTDOWN))
 
     await cleanup(lifecycle, sc)
 
@@ -138,7 +142,7 @@ async def test_operate_multiple_tasks(kit):
 
 
 @pytest.mark.asyncio
-async def test_operate_then_shutdown_interrupts_tasking(kit):
+async def test_operate_then_shutdown_interrupts_tasking(kit, until):
     """Changing demand to SHUTDOWN while tasking interrupts the program."""
     sc = await kit.register_service("ctrl-svc", "0.1.0")
     controller = await sc.register_controller("ctrl1")
@@ -187,15 +191,14 @@ async def test_operate_then_shutdown_interrupts_tasking(kit):
 
     async with asyncio.timeout(15.0):
         await shutdown_ran.wait()
-        while lifecycle.belief_state != InternalControllerState.SHUTDOWN:
-            await asyncio.sleep(0.05)
+        await until(lambda: reports(kit, InternalControllerState.SHUTDOWN))
 
     await cleanup(lifecycle, sc)
 
 
 @pytest.mark.asyncio
-async def test_standby_cycle(kit):
-    """Lifecycle drives STANDBY → StandbyTask runs on controller."""
+async def test_standby_cycle(kit, until):
+    """STANDBY demand runs the controller's standby task."""
     sc = await kit.register_service("ctrl-svc", "0.1.0")
     controller = await sc.register_controller("ctrl1")
 
@@ -214,15 +217,14 @@ async def test_standby_cycle(kit):
 
     async with asyncio.timeout(10.0):
         await standby_ran.wait()
-        while lifecycle.belief_state != InternalControllerState.STANDBY:
-            await asyncio.sleep(0.05)
+        await until(lambda: reports(kit, InternalControllerState.STANDBY))
 
     await cleanup(lifecycle, sc)
 
 
 @pytest.mark.asyncio
-async def test_interrupt_program_aborts_running_task(kit):
-    """A program with interrupt=True has its running task aborted when a new program takes over."""
+async def test_interrupt_program_aborts_running_task(kit, until):
+    """A replacement demand with interrupt=True aborts the current program's running task."""
     sc = await kit.register_service("ctrl-svc", "0.1.0")
     controller = await sc.register_controller("ctrl1")
     program_a = await sc.register_program("prog_a")
@@ -243,7 +245,7 @@ async def test_interrupt_program_aborts_running_task(kit):
         if not task_a_started.is_set():
             task_a_started.set()
             try:
-                # Block indefinitely — only abort() will unblock this.
+                # Wait for the controller to abort this task.
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
                 task_a_aborted.set()
@@ -275,8 +277,7 @@ async def test_interrupt_program_aborts_running_task(kit):
     lifecycle.start(kit.controller("ctrl1"))
     lifecycle.enable()
 
-    # Start operating with program A with interrupt=True. This means that when program A is
-    # interrupted by a new demand, its running task will be aborted instead of stopped gracefully.
+    # Start program A and leave its controller task running.
     lifecycle.set_demand_state(
         InternalControllerState.OPERATE, program=prog_a_client
     )
@@ -284,7 +285,7 @@ async def test_interrupt_program_aborts_running_task(kit):
     async with asyncio.timeout(10.0):
         await task_a_started.wait()
 
-    # Switch to program B — because program A had interrupt=True, its task is aborted immediately.
+    # The replacement demand requests an abort of program A's running task.
     lifecycle.set_demand_state(
         InternalControllerState.OPERATE, program=prog_b_client, interrupt=True
     )
@@ -298,14 +299,13 @@ async def test_interrupt_program_aborts_running_task(kit):
 
     async with asyncio.timeout(15.0):
         await shutdown_ran.wait()
-        while lifecycle.belief_state != InternalControllerState.SHUTDOWN:
-            await asyncio.sleep(0.05)
+        await until(lambda: reports(kit, InternalControllerState.SHUTDOWN))
 
     await cleanup(lifecycle, sc)
 
 
 @pytest.mark.asyncio
-async def test_non_interrupt_program_waits_for_running_task(kit):
+async def test_non_interrupt_program_waits_for_running_task(kit, until):
     """Without interrupt=True, switching programs waits for the current task to finish gracefully."""
     sc = await kit.register_service("ctrl-svc", "0.1.0")
     controller = await sc.register_controller("ctrl1")
@@ -327,7 +327,7 @@ async def test_non_interrupt_program_waits_for_running_task(kit):
     async def handle_collect(task):
         if not task_a_started.is_set():
             task_a_started.set()
-            # Wait until signaled — stop() will wait for this to complete.
+            # A graceful stop waits for this task to be released.
             await task_a_can_finish.wait()
             task_a_finished.set()
         else:
@@ -363,10 +363,10 @@ async def test_non_interrupt_program_waits_for_running_task(kit):
     async with asyncio.timeout(10.0):
         await task_a_started.wait()
 
-    # Switch to program B — without interrupt, the lifecycle waits for A's task to finish.
+    # Switching to program B without interrupt waits for A's task to finish.
     lifecycle.set_demand_state(InternalControllerState.OPERATE, program=prog_b_client)
 
-    # Give the lifecycle a moment to process the demand change. The task should NOT be aborted.
+    # Allow time for the demand change to be processed while A's task remains running.
     await asyncio.sleep(0.2)
     assert not task_a_finished.is_set(), "task should still be running (not aborted)"
 
@@ -382,21 +382,18 @@ async def test_non_interrupt_program_waits_for_running_task(kit):
 
     async with asyncio.timeout(15.0):
         await shutdown_ran.wait()
-        while lifecycle.belief_state != InternalControllerState.SHUTDOWN:
-            await asyncio.sleep(0.05)
+        await until(lambda: reports(kit, InternalControllerState.SHUTDOWN))
 
     await cleanup(lifecycle, sc)
 
 
 @pytest.mark.asyncio
-async def test_quick_completion_with_long_offer_holds_tasking_loop(kit):
-    """A high-priority program's task completes quickly, but the tasking loop keeps
-    spinning with NoTaskAvailable retries. The lower-priority program does not get
-    scheduled until the operator explicitly changes the demand.
+async def test_quick_completion_with_long_offer_holds_tasking_loop(kit, until):
+    """An empty task factory leaves its program active until demand changes.
 
-    This documents a key system behavior: offer windows are static scheduling hints.
-    When a program exhausts its tasks mid-window, the tasking loop retries every
-    5 seconds rather than yielding to the next candidate."""
+    The lifecycle keeps retrying the demanded program's factory after its last task completes.
+    Changing demand to another program starts that program's tasking.
+    """
     sc = await kit.register_service("ctrl-svc", "0.1.0")
     controller = await sc.register_controller("ctrl1")
     program_a = await sc.register_program("prog_a")
@@ -428,7 +425,7 @@ async def test_quick_completion_with_long_offer_holds_tasking_loop(kit):
         if not done_a.is_set():
             yield CollectTask(task_id=uuid.uuid1(), controller_id="ctrl1")
             done_a.set()
-        # After the first yield, factory_a returns without yielding -> NoTaskAvailable.
+        # Subsequent factory calls yield no task.
 
     @program_b.task_factory
     async def factory_b():
@@ -474,22 +471,14 @@ async def test_quick_completion_with_long_offer_holds_tasking_loop(kit):
 
     async with asyncio.timeout(15.0):
         await shutdown_ran.wait()
-        while lifecycle.belief_state != InternalControllerState.SHUTDOWN:
-            await asyncio.sleep(0.05)
+        await until(lambda: reports(kit, InternalControllerState.SHUTDOWN))
 
     await cleanup(lifecycle, sc)
 
 
 @pytest.mark.asyncio
-async def test_shutdown_task_completes_despite_demand_change(kit):
-    """The default graceful stop waits for the running shutdown task to finish.
-
-    Even though the lifecycle stops the ShutdownProc when the demand changes to OPERATE,
-    the graceful stop mechanism (shield + cleanup) waits for the actual controller task
-    handler to complete before proceeding. The handler does NOT get CancelledError.
-
-    This means the shutdown task runs to completion, then the lifecycle starts the new demand.
-    """
+async def test_shutdown_task_completes_despite_demand_change(kit, until):
+    """Changing demand to OPERATE waits for the running shutdown task to finish."""
     sc = await kit.register_service("ctrl-svc", "0.1.0")
     controller = await sc.register_controller("ctrl1")
     program = await sc.register_program("prog1")
@@ -534,7 +523,7 @@ async def test_shutdown_task_completes_despite_demand_change(kit):
         await init_ran.wait()
         await task_ran.wait()
 
-    # Demand SHUTDOWN — the shutdown task handler will block on the gate.
+    # Demand SHUTDOWN and wait for its handler to block on the gate.
     lifecycle.set_demand_state(InternalControllerState.SHUTDOWN)
 
     async with asyncio.timeout(10.0):
@@ -543,12 +532,10 @@ async def test_shutdown_task_completes_despite_demand_change(kit):
     # While the shutdown task is still running, demand OPERATE again.
     lifecycle.set_demand_state(InternalControllerState.OPERATE, program=prog_client)
 
-    # Give the lifecycle a moment to process the demand change. The ShutdownProc is being
-    # gracefully stopped, but the stop waits for cleanup futures (the shielded execute_task).
+    # Allow time for graceful cleanup to begin waiting for the shutdown task.
     await asyncio.sleep(0.3)
 
-    # The shutdown handler should NOT have been cancelled — it's shielded.
-    # It should still be blocked on the gate, waiting for us to release it.
+    # Graceful cleanup leaves the shutdown handler waiting on its gate.
     assert not shutdown_finished.is_set(), "shutdown should still be waiting (shielded from cancel)"
 
     # Release the shutdown handler.
@@ -558,12 +545,11 @@ async def test_shutdown_task_completes_despite_demand_change(kit):
     async with asyncio.timeout(10.0):
         await shutdown_finished.wait()
 
-    # The pending OPERATE demand should take effect — init should run again.
+    # The pending OPERATE demand initializes the controller again.
     init_ran.clear()
     async with asyncio.timeout(15.0):
         await init_ran.wait()
-        while lifecycle.belief_state != InternalControllerState.OPERATE:
-            await asyncio.sleep(0.05)
+        await until(lambda: reports(kit, InternalControllerState.OPERATE))
 
     await cleanup(lifecycle, sc)
 
@@ -630,17 +616,22 @@ async def test_cancelled_procedure_restarts_current_demand(kit):
     restarted = asyncio.Event()
     release = asyncio.Event()
 
+    class CancellingStandby(StandbyProcedure):
+        async def state_logic(self):
+            nonlocal starts
+            starts += 1
+
+            if starts == 1:
+                raise asyncio.CancelledError()
+
+            restarted.set()
+            await release.wait()
+
     class CancellingLifecycle(ControllerLifecycle):
-        class StandbyProc(DemandProc):
-            async def state_logic(self):
-                nonlocal starts
-                starts += 1
-
-                if starts == 1:
-                    raise asyncio.CancelledError()
-
-                restarted.set()
-                await release.wait()
+        procedures = {
+            **ControllerLifecycle.procedures,
+            InternalControllerState.STANDBY: CancellingStandby,
+        }
 
     sc = await kit.register_service("ctrl-svc", "0.1.0")
     lifecycle = CancellingLifecycle()

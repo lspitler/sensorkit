@@ -31,6 +31,9 @@ class ControllerConfig(BaseModel):
     depends_on: list[str] = Field(default_factory=list)
     estimated_startup_time: float = 0.0
     estimated_shutdown_time: float = 0.0
+    external_change_delay: float = Field(default=30.0, ge=0.0, allow_inf_nan=False)
+    """Seconds to wait before restoring the demanded state and lifecycle context after an
+    external change. Zero disables the wait."""
     modes: ModeList = Field(default_factory=list)
     constraints: list[Constraint] = Field(default_factory=list)
     tasking: list[ProgramConfig] = Field(default_factory=list)
@@ -105,7 +108,7 @@ class ControllerDriver:
         self.constraints = ConstraintManager(config.constraints)
 
         # Create the lifecycle object.
-        self.lifecycle = ControllerLifecycle()
+        self.lifecycle = ControllerLifecycle(external_change_delay=config.external_change_delay)
 
     async def start(
         self,
@@ -232,6 +235,7 @@ class ControllerDriver:
         constrained = self.constraints.is_constrained()
         contexts = self._context_maps[None]
         interrupt = False
+        program_interrupt = False
 
         if constrained:
             if state != InternalControllerState.SHUTDOWN:
@@ -248,20 +252,16 @@ class ControllerDriver:
             program_name = str(program.entity)
             program_config = self.config.program_config(program_name)
 
-            # Use the configured contexts and interrupt policy for this program. Program-configured
-            # interrupts only apply in the OPERATE state, as program tasking must not interrupt
-            # lifecycle tasks.
+            # The lifecycle defers program interruption until OPERATE with no pending lifecycle task.
             contexts = self._context_maps[program_name]
-            interrupt |= (
-                self.lifecycle.belief_state == InternalControllerState.OPERATE
-                and program_config.interrupt
-            )
+            program_interrupt = program_config.interrupt
 
         changed = self.lifecycle.set_demand_state(
             state,
             contexts=contexts,
             program=program,
             interrupt=interrupt,
+            program_interrupt=program_interrupt,
         )
 
         if changed:

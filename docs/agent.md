@@ -39,6 +39,9 @@ automation:
       # Used for schedule lookahead so the sensor is ready when a window opens
       estimated_startup_time: 60.0
 
+      # Seconds to wait before restoring the desired state after an external change
+      external_change_delay: 30.0
+
       modes:
         - name: nighttime
           state: operate
@@ -74,6 +77,10 @@ automation:
         - program: BackupSurvey
           priority: 3
 ```
+
+`external_change_delay` controls how long the agent waits before restoring the desired controller state and lifecycle context after an external change.
+It defaults to 30 seconds; set it to 0 to disable the wait.
+See [Controller state and tasking](#controller-state-and-tasking) for details.
 
 ---
 
@@ -182,6 +189,36 @@ Programs can also be excluded from scheduling at runtime without touching config
 sensorkit agent exclude MyProgram
 sensorkit agent include MyProgram
 ```
+
+## Controller state and tasking
+
+The agent compares the controller's reported state with the state chosen by the election.
+It also checks the lifecycle context, the keyword values attached to the Init, Standby, or Shutdown task.
+If both match and no transition is pending, the agent skips the lifecycle task.
+If a running lifecycle task is already transitioning to the desired state with the matching context, the agent waits up to five minutes or until that task expires, whichever comes first.
+When the agent sends a lifecycle task, it interrupts any running controller task.
+
+The agent keeps the selected program's existing tasking session when all of the following hold:
+
+- The session is running on the desired controller with matching task contexts.
+- The controller reports the desired state and lifecycle context, with no transition pending.
+- The session has no stop pending.
+
+Otherwise, the agent aborts that program's tasking before sending lifecycle tasks.
+Before starting a new tasking session, the agent aborts any running controller task.
+The agent manages tasking sessions it starts or adopts, but does not stop other programs' sessions.
+Tasks from those sessions can still be interrupted on the controller.
+
+### External changes
+
+If the controller unexpectedly changes a state or lifecycle context that the agent has confirmed, the agent stops its program tasking and waits for `external_change_delay` before restoring the desired state.
+This delay applies to changes outside the agent's pending lifecycle tasks.
+Shutdown and recovery bypass it.
+
+While the controller's state or lifecycle context differs from the desired values, changing the desired state, lifecycle context, or selected program restarts the delay.
+Further controller changes alone do not extend it.
+The delay ends early if the controller reports the desired state and context.
+When the delay ends, the agent reevaluates the latest demand before sending tasks.
 
 ## CLI control
 

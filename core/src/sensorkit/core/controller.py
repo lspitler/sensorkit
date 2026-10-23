@@ -170,6 +170,14 @@ class ControllerOperatingState(Event):
 
         return data
 
+    def matches(
+        self,
+        state: InternalControllerState,
+        context: KeywordDict,
+    ) -> bool:
+        """Return whether the reported state and context match with no transition pending."""
+        return self.current == state and self.target is None and self.context == context
+
     def derive(
         self,
         *,
@@ -400,7 +408,7 @@ class ControllerMonitor:
         self._teardown: asyncio.Task[None] | None = None
 
         # Set by the first state, a failure, or a stop.
-        self._settled = asyncio.Event()
+        self._startup_complete = asyncio.Event()
 
     async def start(self, *, timeout: float = 10.0) -> None:
         """Start observation and wait for the first valid state.
@@ -426,7 +434,7 @@ class ControllerMonitor:
 
         try:
             async with asyncio.timeout(timeout):
-                await self._settled.wait()
+                await self._startup_complete.wait()
         except TimeoutError:
             error = TimeoutError(f"{self.controller.entity} state not observed in {timeout} s")
             self._fail(error)
@@ -560,7 +568,7 @@ class ControllerMonitor:
             # Subscribers share this copy, apart from the cache.
             self._observer.notify(operating.model_copy(deep=True))
 
-        self._settled.set()
+        self._startup_complete.set()
 
     def _fail(self, error: Exception):
         """Record the first failure and end observation."""
@@ -568,7 +576,7 @@ class ControllerMonitor:
             self._error = error
 
         self._observer.close()
-        self._settled.set()
+        self._startup_complete.set()
 
     async def _abandon(self, failure: BaseException) -> NoReturn:
         """Join teardown after a failed start, then raise the startup failure."""
@@ -585,7 +593,7 @@ class ControllerMonitor:
         if self._teardown is None:
             # No await before cancellation, so the reader cannot deliver after closure.
             self._observer.close()
-            self._settled.set()
+            self._startup_complete.set()
             self._reader.cancel()
             self._teardown = asyncio.create_task(self._join_reader(self._reader))
 

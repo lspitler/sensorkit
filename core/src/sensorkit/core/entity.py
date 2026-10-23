@@ -16,7 +16,7 @@ from pydantic import (
     ValidationError,
 )
 
-from sensorkit.backend.base import Entity
+from sensorkit.backend.base import Entity, KeyNotFound
 from sensorkit.backend.event import Event, EventMultiplexer, EventStreamConsumer
 from sensorkit.backend.request import (
     Call,
@@ -170,6 +170,15 @@ class EntityClient(EntityBase):
             self._online_monitor = asyncio.create_task(self._monitor_online_state())
 
         return self._online_observer.consume(initial_value=True)
+
+    async def is_online(self) -> bool:
+        """Return whether the entity currently holds its lease."""
+        try:
+            entry = await self._kv.get("EntityLease")
+        except KeyNotFound:
+            return False
+
+        return not entry.deleted()
 
     def get_event_mux(self) -> EventMultiplexer:
         """Return the shared event consumer object for this entity."""
