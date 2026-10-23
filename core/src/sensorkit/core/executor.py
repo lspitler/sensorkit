@@ -9,8 +9,15 @@ from typing import Any, Callable
 
 from loguru import logger
 
+from sensorkit.backend.request import Call, CallError, CallRejected
+from sensorkit.common.aio import cleanup_future, interruptible_wait
 from sensorkit.common.keyword import KeywordDict
-from sensorkit.core.controller import ControllerClient
+from sensorkit.core.controller import (
+    ControllerClient,
+    ExecuteResponseMessage,
+    TaskExecutionResult,
+)
+from sensorkit.core.entity import EventsNotSubscribed
 from sensorkit.core.task import Task, TaskContextMap, TaskExecution, TaskSubmission
 
 type TaskFactoryResult = Task | TaskSubmission | None
@@ -93,6 +100,205 @@ async def _resume_factory(
             "Task factory generator yielded more than once! This indicates a programming error."
         )
         await agen.aclose()
+
+
+class TaskOutcomeUnknown(Exception):
+    """Task acceptance or execution completion could not be confirmed."""
+
+
+class TaskFailed(CallError):
+    """A task execution ended without success."""
+
+    def __init__(self, *args, aborted: bool = False):
+        super().__init__(*args)
+        self.aborted = aborted
+        """Whether this call requested an abort before receiving the failed result."""
+
+
+class TaskCall:
+    """Send one task to a controller and follow the execution it starts.
+
+    Rejection confirms that the task did not run. After acceptance, the execution's end event
+    confirms success or failure. Missing acceptance or completion leaves the call unresolved.
+    """
+
+    def __init__(
+        self,
+        controller: ControllerClient,
+        task: Task,
+        *,
+        context: KeywordDict | None = None,
+        expiry_time: datetime | None = None,
+        interrupt: bool = False,
+    ):
+        """Create a call without sending it.
+
+        Args:
+            controller: The controller to execute the task.
+            task: The task to execute.
+            context: Optional keyword context to attach to the execution.
+            expiry_time: Optional time after which the execution should be considered expired.
+            interrupt: Whether to interrupt any task currently in progress.
+        """
+        self.controller = controller
+        self.task = task
+        self.context = context
+        self.expiry_time = expiry_time
+        self.interrupt = interrupt
+        self.execution: TaskExecution | None = None
+        """The execution the controller identified, if any."""
+        loop = asyncio.get_running_loop()
+        self._outcome: asyncio.Future[TaskExecutionResult] = loop.create_future()
+        self._outcome.add_done_callback(cleanup_future)
+        self._abort = asyncio.Event()
+        self._sent = False
+        self._follower: asyncio.Task[TaskExecutionResult] | None = None
+
+    async def send(self) -> TaskExecution:
+        """Send the request and wait until the controller accepts the task.
+
+        The request goes out before the caller first suspends. Canceling the caller while it
+        waits for the reply leaves the call unresolved. The returned execution can be awaited
+        for the call's result.
+
+        Raises:
+            RuntimeError: If the call was already sent.
+            EventsNotSubscribed: If the controller's events are not subscribed.
+            BackendError: If the controller's event subscription failed to start.
+            CallRejected: If the controller rejected the task without running it.
+            TaskOutcomeUnknown: If acceptance could not be established.
+        """
+        if self._sent:
+            raise RuntimeError("Task call already sent")
+
+        if not self.controller.get_event_mux().ready():
+            raise EventsNotSubscribed(f"{self.controller.entity} events are not subscribed")
+
+        self._sent = True
+        call = self.controller.execute_task(
+            self.task, context=self.context, expiry_time=self.expiry_time, interrupt=self.interrupt
+        )
+
+        try:
+            await call.invoke()
+        except CallRejected as e:
+            # A rejection reply can still identify the execution it declined.
+            if call.response is not None:
+                self.execution = call.response.execution
+
+            self._outcome.set_exception(e)
+            raise
+        except asyncio.CancelledError as e:
+            # Losing the reply leaves acceptance unknown even if the controller started the task.
+            self._outcome.set_exception(self._outcome_unknown("acceptance is unknown", e))
+            raise
+        except Exception as e:
+            error = self._outcome_unknown("acceptance is unknown", e)
+            self._outcome.set_exception(error)
+            raise error from e
+
+        if call.response is None or call.response.execution is None:
+            error = self._outcome_unknown("was accepted without an execution")
+            self._outcome.set_exception(error)
+            raise error
+
+        execution = call.response.execution
+        self.execution = execution
+
+        # Holders of the execution await the outcome without canceling it.
+        shared = asyncio.shield(self._outcome)
+        shared.add_done_callback(cleanup_future)
+        execution.bind_result(shared)
+
+        self._follower = asyncio.create_task(self._follow(call, execution))
+        self._follower.add_done_callback(self._settle)
+
+        return execution
+
+    def abort(self):
+        """Request an abort of the execution once the controller accepts it.
+
+        Repeated requests retry a failed abort until the controller accepts one.
+        The execution's end event determines the result.
+        """
+        self._abort.set()
+
+    def future(self) -> asyncio.Future[TaskExecutionResult]:
+        """Return the shared future for task rejection or the execution result.
+
+        The future raises `CallRejected` if the task never ran, `TaskFailed` if the execution
+        ended without success, and `TaskOutcomeUnknown` if acceptance or completion is unknown.
+        Use `asyncio.wait` or `asyncio.shield` to keep waiter cancellation from canceling it.
+        """
+        return self._outcome
+
+    def error(self) -> BaseException | None:
+        """Return why the call ended without success, or None if running or successful."""
+        if not self._outcome.done():
+            return None
+
+        if self._outcome.cancelled():
+            return self._outcome_unknown("outcome was cancelled")
+
+        return self._outcome.exception()
+
+    def _outcome_unknown(self, reason: str, cause: BaseException | None = None) -> TaskOutcomeUnknown:
+        error = TaskOutcomeUnknown(f"{self.task.task_type} {reason}")
+        error.__cause__ = cause
+        return error
+
+    def _settle(self, follower: asyncio.Task[TaskExecutionResult]):
+        if self._outcome.done():
+            return
+
+        if follower.cancelled():
+            self._outcome.set_exception(self._outcome_unknown("call was cancelled"))
+        elif (error := follower.exception()) is not None:
+            self._outcome.set_exception(error)
+        else:
+            self._outcome.set_result(follower.result())
+
+    async def _follow(
+        self,
+        call: Call[ExecuteResponseMessage, TaskExecutionResult],
+        execution: TaskExecution,
+    ) -> TaskExecutionResult:
+        result = call.get_future()
+        aborted = False
+        delivered = False
+
+        while not result.done():
+            if not await interruptible_wait((result,), interrupt=self._abort):
+                break
+
+            # Requests received during this send trigger another attempt if the send fails.
+            self._abort.clear()
+            aborted = True
+
+            if not delivered:
+                delivered = await self._send_abort(execution)
+
+        error = asyncio.CancelledError() if result.cancelled() else result.exception()
+
+        match error:
+            case None:
+                return result.result()
+            case CallError():
+                outcome = "aborted" if aborted else "failed"
+                raise TaskFailed(f"{self.task.task_type} {outcome}", aborted=aborted) from error
+            case _:
+                # The end event was lost, so the execution may still be running.
+                raise self._outcome_unknown("end is unknown", error)
+
+    async def _send_abort(self, execution: TaskExecution) -> bool:
+        """Send a targeted abort and return whether the controller accepted it."""
+        try:
+            await self.controller.abort_task(execution.task_id).invoke()
+        except Exception as e:
+            logger.warning(f"Could not abort {self.task.task_type} execution ({e!r})")
+            return False
+
+        return True
 
 
 class TaskingLoop:
