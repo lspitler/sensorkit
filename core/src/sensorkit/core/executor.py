@@ -10,7 +10,7 @@ from typing import Any, Callable
 from loguru import logger
 
 from sensorkit.backend.request import Call, CallError, CallRejected
-from sensorkit.common.aio import cleanup_future, interruptible_wait
+from sensorkit.common.aio import cleanup_future, defer_cancellation, interruptible_wait
 from sensorkit.common.keyword import KeywordDict
 from sensorkit.core.controller import (
     ControllerClient,
@@ -302,7 +302,7 @@ class TaskCall:
 
 
 class TaskingLoop:
-    """Executes a loop that sources tasks from a factory and runs them on a target Controller."""
+    """Produce tasks for one controller and track the last call through finalization."""
 
     def __init__(
         self,
@@ -317,38 +317,64 @@ class TaskingLoop:
         self.task_factory: TaskFactoryFunc = factory_func
         self.contexts = contexts
         self._task_group = task_group
-        # Invoked with the live `TaskExecution` when a task begins running and with `None` when it
-        # completes, so an owner (the program) can publish its current tasking state. Error/abort
-        # exits are left to the owner's loop-teardown path rather than signalled here.
+        # Notify the program when a task starts or completes normally.
+        # On failure or abort, the program clears tasking state after loop finalization.
         self._on_task_change = on_task_change
         self._aio_task: asyncio.Task | None = None
         self._stop_requested = asyncio.Event()
+        self.finalized = False
+        """Whether task production ended and the last call returned a result or error."""
+        self.unresolved = False
+        """Whether the last call could not confirm task acceptance or completion."""
+        self._call: TaskCall | None = None
+        self._finalization: asyncio.Task | None = None
 
     def start(self):
         """Activate the tasking loop."""
-        if self._aio_task:
+        if self._aio_task is not None or self.finalized:
             raise RuntimeError("Tasking loop was already started")
 
-        self._aio_task = self._task_group.create_task(self._tasking_loop())
+        self._aio_task = self._task_group.create_task(self._run())
         return self._aio_task
 
-    async def stop(self, *, timeout=None):
-        """Deactivate the tasking loop, invalidating the object."""
-        try:
-            # Wait for a graceful stop.
-            self._stop_requested.set()
+    async def finalize(self):
+        """Wait for the producer and last task call, preserving them if the caller is canceled."""
+        await asyncio.shield(self._finalizing())
 
-            async with asyncio.timeout(timeout):
-                await self._aio_task
-        except TimeoutError:
-            # The loop task was cancelled and will call abort on the Controller.
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._aio_task
+    def _finalizing(self) -> asyncio.Task[None]:
+        """Return the shared finalization task, starting it if needed."""
+        if self._finalization is None:
+            self._finalization = asyncio.create_task(self._finalize())
+            self._finalization.add_done_callback(cleanup_future)
+
+        return self._finalization
+
+    @property
+    def running(self) -> bool:
+        """Whether the task producer is running and no stop has been requested."""
+        return not self._producer_done() and not self._stop_requested.is_set()
 
     @property
     def stop_requested(self):
         """Return True if a stop has been requested for this tasking loop."""
         return self._stop_requested.is_set()
+
+    def request_stop(self, *, abort: bool = False):
+        """Stop producing tasks, optionally canceling the factory and aborting the current task."""
+        self._stop_requested.set()
+
+        if abort:
+            self._cancel_producer()
+
+            if self._call is not None:
+                self._call.abort()
+
+    def _producer_done(self) -> bool:
+        return self._aio_task is None or self._aio_task.done()
+
+    def _cancel_producer(self):
+        if self._aio_task is not None and not self._aio_task.cancelling():
+            self._aio_task.cancel()
 
     def _resolve_context(self, submission: TaskSubmission) -> KeywordDict | None:
         """Merge the factory-supplied context with the per-task-type context bundle."""
@@ -376,6 +402,9 @@ class TaskingLoop:
         return default
 
     async def _tasking_loop(self):
+        # Task calls follow their executions through the controller's events.
+        await self.controller.subscribe_events()
+
         while not self._stop_requested.is_set():
             # Source the next task from the factory.
             try:
@@ -386,9 +415,19 @@ class TaskingLoop:
 
                 continue
 
+            if self._stop_requested.is_set():
+                await self._throw(agen, asyncio.CancelledError())
+                return
+
             # Dispatch and run it. A fatal error ends the loop.
             if not await self._dispatch(agen, submission):
                 return
+
+    async def _run(self):
+        try:
+            await self._tasking_loop()
+        except Exception as e:
+            logger.opt(exception=e).error(f"Task factory failed for {self.controller.entity}")
 
     async def _dispatch(
         self,
@@ -410,44 +449,45 @@ class TaskingLoop:
             f"Dispatching {task.task_type} ({type(task).__name__}) to {self.controller.entity}"
         )
 
-        # Instruct the controller to begin execution. The controller mints the identity and binds
-        # the in-flight call as the execution's result future.
+        call = TaskCall(self.controller, task, context=context, expiry_time=expiry_time)
+        self._call = call
+
+        # Deliver dispatch errors to the suspended factory so its error handling and cleanup run.
         try:
-            execution = await self.controller.start_task(
-                task, context=context, expiry_time=expiry_time
-            )
-        except (Exception, asyncio.CancelledError) as e:
-            # Dispatch failed before the factory was resumed. Deliver the error into the still-
-            # suspended generator so its except/finally blocks run, then abandon this task.
+            # Preserve acceptance so cancellation can abort the specific execution that started.
+            execution = await defer_cancellation(call.send())
+        except asyncio.CancelledError as e:
+            # Interrupted tasking aborts the execution once the controller accepts it.
+            call.abort()
+            await self._throw(agen, e)
+            return False
+        except Exception as e:
             logger.error(f"Failed to dispatch {task.task_type} to {self.controller.entity}: {e!r}")
-
-            if agen is not None:
-                with contextlib.suppress(BaseException):
-                    await agen.athrow(e)
-
+            await self._throw(agen, e)
             return False
 
-        await self._notify_task_change(execution)
-
         try:
+            await self._notify_task_change(execution)
+
             async with asyncio.timeout(ttl):
                 # Resume the factory with the running execution (task_id now known). It may await
                 # the execution to consume the result and run post-task logic.
                 if agen is not None:
-                    await _resume_factory(agen, execution)
+                    resumed, agen = agen, None
+                    await _resume_factory(resumed, execution)
 
-                # Guarantee completion before the next iteration, regardless of whether the factory
-                # awaited the execution itself. If it did, the call is already settled and this
-                # returns (or re-raises) immediately; if it consumed an error without re-raising,
-                # the execution is done and we leave that decision to the factory.
-                if not execution.done():
-                    await execution
+                # Wait for completion if the factory did not await the execution.
+                # A factory that handled a completed call's error allows tasking to continue.
+                if not call.future().done():
+                    await asyncio.shield(call.future())
         except (Exception, asyncio.CancelledError) as e:
-            # On error/abort the loop terminates; clearing the tasking state is left to the owner's
-            # teardown so we don't emit while unwinding (possibly under cancellation).
-            await self._abort(execution, e)
+            # The program clears tasking state after loop finalization.
+            logger.opt(exception=e).debug(f"Tasking ended during {execution.task_id}")
+            call.abort()
+            await self._throw(agen, e)
             return False
 
+        self._call = None
         await self._notify_task_change(None)
         logger.info(f"Finished {task.task_type} ({type(task).__name__})")
 
@@ -458,19 +498,23 @@ class TaskingLoop:
         if self._on_task_change is not None:
             await self._on_task_change(execution)
 
-    async def _abort(self, execution: TaskExecution, e: BaseException):
-        """Log and abort an in-flight task following a timeout, interrupt, or unhandled error."""
-        msg = f"Aborting {execution.task.task_type} on {self.controller.entity}"
+    @staticmethod
+    async def _throw(
+        agen: AsyncGenerator[TaskFactoryResult, TaskExecution] | None, e: BaseException
+    ):
+        """Send an error to a factory suspended at its first task."""
+        if agen is not None:
+            with contextlib.suppress(BaseException):
+                await agen.athrow(e)
 
-        match e:
-            case asyncio.CancelledError():
-                logger.error(f"{msg} due to interrupt")
-            case _:
-                logger.error(f"{msg} due to error")
-                logger.opt(exception=e).debug(
-                    f"{type(e).__name__} during execution of {execution.task_id}"
-                )
+    async def _finalize(self):
+        if self._aio_task is not None:
+            await asyncio.wait((self._aio_task,))
 
-        with contextlib.suppress(BaseException):
-            # Kick off an abort here, but don't wait for it to complete.
-            await self.controller.abort_task(execution.task_id).invoke()
+        # The producer can exit while its last controller task is still running.
+        if (call := self._call) is not None:
+            await asyncio.wait((call.future(),))
+            self.unresolved = isinstance(call.error(), TaskOutcomeUnknown)
+
+        self._call = None
+        self.finalized = True

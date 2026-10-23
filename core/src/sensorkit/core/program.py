@@ -175,14 +175,22 @@ class ProgramClient(EntityClient):
         )
 
     async def stop_tasking(self):
-        """Request that the Program stop tasking and wait for any in flight task to complete."""
+        """Stop producing tasks and wait for the program's current controller task to end.
+
+        Raises:
+            CallError: If the program cannot confirm that its controller task ended.
+        """
         await self.call(
             set_active_state_request,
             ProgramActiveStateRequest(action="stop"),
         )
 
     async def abort_tasking(self):
-        """Request that the Program stop tasking and abort any in flight task immediately."""
+        """Stop producing tasks, abort the program's current controller task, and await its end.
+
+        Raises:
+            CallError: If the program cannot confirm that its controller task ended.
+        """
         await self.call(
             set_active_state_request,
             ProgramActiveStateRequest(action="abort"),

@@ -14,7 +14,7 @@ from sensorkit.backend.base import Entity, KVError
 from sensorkit.backend.event import Event
 from sensorkit.backend.request import CallContext
 from sensorkit.core.entity import EntityDetails, EntityInfo
-from sensorkit.core.executor import TaskFactoryFunc, TaskingLoop
+from sensorkit.core.executor import TaskFactoryFunc, TaskingLoop, TaskOutcomeUnknown
 from sensorkit.core.impl.entity import EntityImpl
 from sensorkit.core.program import (
     OfferInterval,
@@ -110,6 +110,8 @@ class ProgramImpl(EntityImpl, ProgramInterface):
         self._state_lock = asyncio.Lock()
         self._task_factory: TaskFactoryFunc | None = None
         self._task_loop: TaskingLoop | None = None
+        self._task_finalizer: asyncio.Task | None = None
+        self._control_lock = asyncio.Lock()
 
     @override
     async def init_impl(self):
@@ -156,9 +158,6 @@ class ProgramImpl(EntityImpl, ProgramInterface):
         return func
 
     async def _start_loop(self, contexts: TaskContextMap):
-        if self._task_loop is not None:
-            return
-
         logger.debug(f"starting tasking loop with {contexts=}")
 
         async def _on_task_change(execution: TaskExecution | None):
@@ -177,102 +176,109 @@ class ProgramImpl(EntityImpl, ProgramInterface):
             task_group=self.task_group,
             on_task_change=_on_task_change,
         )
+        loop = self._task_loop
 
-        # Start a background task to make sure the end states are properly handled whether the
-        # loop ends by request or by error. We take pains to do this before starting the loop
-        # itself to eliminate data races and ensure event ordering.
+        # Create the finalizer before starting task production so even an immediate exit is handled.
+        # Release it after publishing the active state to keep state events in order.
         queue = asyncio.Queue()
 
         async def _finalize_loop():
             aio_task = await queue.get()
 
-            try:
+            # Shutdown cancellation reaches the producer and starts abort cleanup.
+            with contextlib.suppress(asyncio.CancelledError):
                 await aio_task
-            finally:
-                # Clear any lingering tasking state: the loop may have exited mid-task (error or
-                # abort), where clearing is intentionally deferred to teardown here.
-                if self._state.tasking_state.executing_task is not None:
-                    await self._update_state("tasking_state", ProgramTaskingState())
 
-                await self._update_state(
-                    "active_state",
-                    ProgramActiveState(active=False, origin="request")
-                    if self._task_loop.stop_requested
-                    else ProgramActiveState(active=False, origin="error"),
-                )
-                logger.info(f"Tasking loop exiting by {self._state.active_state.origin}")
-                self._task_loop = None
-                self._task_finalizer = None
+            await loop.finalize()
+
+            # Failure or abort may leave a published execution after task production ends.
+            if self._state.tasking_state.executing_task is not None:
+                await self._update_state("tasking_state", ProgramTaskingState())
+
+            await self._update_state(
+                "active_state",
+                ProgramActiveState(active=False, origin="request")
+                if loop.stop_requested
+                else ProgramActiveState(active=False, origin="error"),
+            )
+            logger.info(f"Tasking loop exiting by {self._state.active_state.origin}")
+
+            self._task_loop = None
+            self._task_finalizer = None
 
         self._task_finalizer = self.task_group.create_task(_finalize_loop())
 
-        # Finally, we can start the tasking loop and update our state.
+        # Publish the active state before allowing the finalizer to publish the inactive state.
         with self.enter_context():
             logger.info("Starting tasking loop")
             aio_task = self._task_loop.start()
 
         await self._update_state(
             "active_state",
-            ProgramActiveState(active=True, origin="request"),
+            ProgramActiveState(active=True, origin="request", contexts=contexts),
         )
 
         # Tell the finalizer about the loop task.
         queue.put_nowait(aio_task)
 
-    async def _stop_loop(self, *, timeout=None):
-        if self._task_loop is None:
+    async def _stop_loop(self, loop: TaskingLoop | None, *, abort: bool = False):
+        if loop is None or self._task_loop is not loop:
             return
+
+        finalizer = self._task_finalizer
+        loop.request_stop(abort=abort)
+        active = self._state.active_state
 
         await self._update_state(
             "active_state",
-            ProgramActiveState(active=True, origin=self._state.active_state.origin, stopping=True),
+            ProgramActiveState(
+                active=True, origin=active.origin, stopping=True, contexts=active.contexts
+            ),
+            loop=loop,
         )
 
-        # Due to the await above, we have to check again whether the loop is still running, as it
-        # may have been concurrently stopped.
-        if self._task_loop is None:
-            return
+        # Wait until the finalizer has published the program's inactive state.
+        await asyncio.shield(finalizer)
 
-        try:
-            await self._task_loop.stop(timeout=timeout)
-        except (Exception, asyncio.CancelledError) as e:
-            logger.warning(f"Error while stopping tasking loop: {e}")
-
-        # Make sure the end state has been updated by the finalizer.
-        if self._task_finalizer is not None:
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task_finalizer
+    @staticmethod
+    def _require_ended(loop: TaskingLoop | None):
+        """Raise if the loop could not confirm task acceptance or completion."""
+        if loop is not None and loop.unresolved:
+            raise TaskOutcomeUnknown(f"{loop.controller.entity} work may still be running")
 
     async def _set_enable_state(self, request: ProgramEnableStateRequest):
-        if not request.enable and not self._state.enable_state.enabled:
-            return
+        async with self._control_lock:
+            if not request.enable and not self._state.enable_state.enabled:
+                return
 
-        enablement_changed = request.enable ^ self._state.enable_state.enabled
-        controller_changed = request.controller != self._state.enable_state.controller
+            enablement_changed = request.enable ^ self._state.enable_state.enabled
+            controller_changed = request.controller != self._state.enable_state.controller
 
-        if not enablement_changed and not controller_changed:
-            return
+            if not enablement_changed and not controller_changed:
+                return
 
-        logger.info(
-            f"{'Enabling' if request.enable else 'Disabling'} "
-            f"{self.entity} for target {request.controller}"
-        )
+            if controller_changed or not request.enable:
+                # Confirm the current task ended before changing controllers or disabling.
+                loop = self._task_loop
+                await self._stop_loop(loop, abort=True)
+                self._require_ended(loop)
 
-        await self._update_state(
-            "enable_state",
-            ProgramEnableState(enabled=request.enable, controller=request.controller),
-        )
+            logger.info(
+                f"{'Enabling' if request.enable else 'Disabling'} "
+                f"{self.entity} for target {request.controller}"
+            )
 
-        if request.enable:
-            # Call the enable hook.
-            await self._call_with_context(self._enable_hooks)
-        else:
-            # Disabling the program implies setting the active state low. We consider this an abort
-            # case; if the caller wants a graceful stop, they can explicitly stop tasking first.
-            await self._stop_loop(timeout=0)
+            await self._update_state(
+                "enable_state",
+                ProgramEnableState(enabled=request.enable, controller=request.controller),
+            )
 
-            # Call the disable hook.
-            await self._call_with_context(self._disable_hooks)
+            if request.enable:
+                # Call the enable hook.
+                await self._call_with_context(self._enable_hooks)
+            else:
+                # Call the disable hook.
+                await self._call_with_context(self._disable_hooks)
 
     async def _set_active_state(
         self,
@@ -283,44 +289,29 @@ class ProgramImpl(EntityImpl, ProgramInterface):
             logger.info(f"Requested to {request.action} the tasking loop")
 
         if request.action == "start":
-            # Cannot activate tasking if we aren't enabled with a target Controller configured.
-            if not self._state.enable_state.enabled or not self._state.enable_state.controller:
-                call.reject(reason="Program is not enabled with a controller")
+            if self._control_lock.locked():
+                call.reject(reason="Program enablement is changing")
                 return
 
-            if (
-                self._state.active_state.active
-                and request.contexts != self._state.active_state.contexts
-            ):
-                # Don't support restart-with-different-context in a single request.
-                call.reject(reason="Program is already active with different contexts")
-                return
+            async with self._control_lock:
+                await self._start_tasking(request, call)
 
-        call.accept()
-
-        if request.active_state() == self._state.active_state.active:
-            # We are already in the requested state, so claim success.
-            await call.succeed(result=None)
             return
 
+        loop = self._task_loop
+        call.accept()
+
         try:
-            match request.action:
-                case "start":
-                    # Start a new tasking loop.
-                    with self.enter_context():
-                        await self._start_loop(request.contexts)
-                case "stop":
-                    # Stop the tasking loop gracefully.
-                    # TODO: add backstop timeout reflecting maximum task time
-                    await call.progress_from_task(
-                        self.task_group.create_task(self._stop_loop()),
-                        cadence=6,
-                        ttl=10,
-                    )
-                case "abort":
-                    # Abort the tasking loop immediately.
-                    with self.enter_context():
-                        await self._stop_loop(timeout=0)
+            with self.enter_context():
+                await call.progress_from_task(
+                    self.task_group.create_task(
+                        self._stop_loop(loop, abort=request.action == "abort")
+                    ),
+                    cadence=6,
+                    ttl=10,
+                )
+
+            self._require_ended(loop)
         except Exception as e:
             with self.enter_context():
                 logger.exception("Error setting active state")
@@ -329,8 +320,49 @@ class ProgramImpl(EntityImpl, ProgramInterface):
         else:
             await call.succeed(result=None)
 
-    async def _update_state(self, key: str, event: Event):
+    async def _start_tasking(self, request: ProgramActiveStateRequest, call: CallContext[None]):
+        loop = self._task_loop
+        finalizer = self._task_finalizer
+
+        if loop is not None and not loop.running:
+            if not loop.finalized:
+                call.reject(reason="Previous tasking is not finalized")
+                return
+
+            # Wait for the previous loop's inactive event before checking whether to start tasking.
+            await asyncio.shield(finalizer)
+
+        # Cannot activate tasking without an enabled target controller.
+        if not self._state.enable_state.enabled or not self._state.enable_state.controller:
+            call.reject(reason="Program is not enabled with a controller")
+            return
+
+        if (
+            self._state.active_state.active
+            and request.contexts != self._state.active_state.contexts
+        ):
+            call.reject(reason="Program is already active with different contexts")
+            return
+
+        call.accept()
+
+        try:
+            if not self._state.active_state.active:
+                with self.enter_context():
+                    await self._start_loop(request.contexts)
+        except Exception as e:
+            with self.enter_context():
+                logger.exception("Error setting active state")
+
+            await call.fail(f"{type(e).__name__} setting active state ({e})")
+        else:
+            await call.succeed(result=None)
+
+    async def _update_state(self, key: str, event: Event, *, loop: TaskingLoop | None = None):
         async with self._state_lock:
+            if loop is not None and self._task_loop is not loop:
+                return
+
             setattr(self._state, key, event)
             await self.emit_event(event)
             await self.kv_put_model(self._state)
