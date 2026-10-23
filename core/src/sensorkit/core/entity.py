@@ -20,8 +20,6 @@ from sensorkit.backend.base import Entity
 from sensorkit.backend.event import Event, EventMultiplexer, EventStreamConsumer
 from sensorkit.backend.request import (
     Call,
-    LongCall,
-    LongRequest,
     RequestBase,
     RequestHandlerFunc,
 )
@@ -308,22 +306,7 @@ class EntityClient(EntityBase):
 
     def call(self, request, data = None) -> Call:
         """Invoke a request."""
-        payload = b"" if data is None else data.model_dump_json().encode()
-        request_coro = self._request.invoke(
-            name=request.name,
-            payload=payload,
-        )
-
-        match request:
-            case LongRequest():
-                return LongCall(
-                    request_coro,
-                    request.response,
-                    request.result,
-                    self._event_mux,
-                )
-            case _:
-                return Call(request_coro, request.response)
+        return request.create_call(self._request, data, self._event_mux)
 
 
 class EventsNotSubscribed(Exception):

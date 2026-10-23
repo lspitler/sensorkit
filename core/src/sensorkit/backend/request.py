@@ -14,11 +14,33 @@ from typing import Any, Callable, Literal, cast, final, override
 from loguru import logger
 from pydantic import BaseModel
 
-from sensorkit.backend.base import RemoteRequestError, StreamContext
+from sensorkit.backend.base import RemoteRequestError, RequestResponseContext, StreamContext
 from sensorkit.backend.event import Event, EventMultiplexer
 from sensorkit.common.aio import cleanup_future, scoped_waiter
 
 type ReplyState = Literal["accepted", "rejected", "succeeded", "failed"]
+
+CALL_MAX_AGE = 1.0
+"""Seconds after sending past which a handler rejects a call.
+
+Callers wait only briefly for a reply, so a call this old has been delayed in transit, such as
+while the backend reconnects, and its caller has stopped waiting. Peer clocks must agree well
+within this margin.
+"""
+
+
+class CallRequest[P: BaseModel | None = Any](BaseModel):
+    """The envelope a call is sent in.
+
+    Carries when the call was sent alongside the caller's message, so the message model holds only
+    application data. A handler rejects a call that arrives too long after it was sent.
+
+    Left unparametrized, the message is kept as plain JSON data.
+    """
+    sent_at: datetime
+    """When the caller sent the call."""
+    message: P | None = None
+    """The caller's message, where the request declares one."""
 
 
 class CallReply[R: BaseModel | None = Any](BaseModel):
@@ -43,10 +65,26 @@ class CallReply[R: BaseModel | None = Any](BaseModel):
 
 
 class Call[R: BaseModel | None, V: BaseModel | None = R](Awaitable[V]):
-    """An invocation of a simple request."""
+    """An invocation of a simple request.
 
-    def __init__(self, coro: Coroutine[Any, Any, bytes], response_type: type[R] | None):
-        self._coro = coro
+    Args:
+        context: The request context of the entity serving the request.
+        name: The request name.
+        message: The caller's message, a model or plain JSON data.
+        response_type: The type expected in the reply.
+    """
+
+    def __init__(
+        self,
+        context: RequestResponseContext,
+        name: str,
+        message: Any,
+        response_type: type[R] | None,
+    ):
+        self._context = context
+        self._name = name
+        self._message = message
+        self._sent = False
         self._reply_type: type[CallReply[R]] = CallReply[response_type]
         self._future: asyncio.Future[V] = asyncio.get_running_loop().create_future()
         self._got_response = False
@@ -56,9 +94,17 @@ class Call[R: BaseModel | None, V: BaseModel | None = R](Awaitable[V]):
 
     @final
     async def _invoke(self, timeout: float, expected: ReplyState) -> CallReply[R]:
+        if self._sent:
+            raise RuntimeError("Call has already been sent")
+
+        self._sent = True
+
+        # Stamp the call as it is sent, so no wait before sending counts against its age.
+        request = CallRequest(sent_at=datetime.now(UTC), message=self._message)
+
         # Send request and await the reply.
         async with asyncio.timeout(timeout):
-            recv = await self._coro
+            recv = await self._context.invoke(self._name, request.model_dump_json().encode())
 
         reply = self._reply_type.model_validate_json(recv)
         self.response = reply.response
@@ -123,7 +169,8 @@ class CallHandler[P: BaseModel | None]:
     """Adapts a request handler to the backend's bytes in, bytes out contract.
 
     Every call gets a reply, including one whose handler raised. A request with no message type
-    passes None, keeping every handler the same arity.
+    passes None, keeping every handler the same arity. A call that arrives too long after it was
+    sent is rejected without running the handler, since its caller has stopped waiting.
     """
 
     def __init__(
@@ -132,6 +179,7 @@ class CallHandler[P: BaseModel | None]:
         run: Callable[..., Awaitable[CallReply]],
     ):
         self._message = message
+        self._request_type: type[CallRequest] = CallRequest[message] if message else CallRequest
 
         # Simple and long-running requests share this class, differing only in the runner bound.
         self._run = run
@@ -140,8 +188,16 @@ class CallHandler[P: BaseModel | None]:
         call_id = uuid.uuid1()
 
         try:
-            message = self._message.model_validate_json(payload) if self._message else None
-            reply = await self._run(call_id, message)
+            request = self._request_type.model_validate_json(payload)
+            age = (datetime.now(UTC) - request.sent_at).total_seconds()
+
+            if age > CALL_MAX_AGE:
+                logger.warning(f"Rejecting call received {age:.1f} s after it was sent")
+                reply = CallReply(
+                    call_id=call_id, state="rejected", reason="call arrived too late"
+                )
+            else:
+                reply = await self._run(call_id, request.message if self._message else None)
         except Exception as e:
             logger.opt(exception=e).debug(f"Call {call_id} failed in its handler")
             error = RemoteRequestError.from_exception(e)
@@ -178,12 +234,14 @@ class LongCall[R: BaseModel | None, V: BaseModel | None](Call[R, V]):
 
     def __init__(
         self,
-        coro: Coroutine[Any, Any, bytes],
+        context: RequestResponseContext,
+        name: str,
+        message: Any,
         response_type: type[R] | None,
         result_type: type[V] | None,
         event_mux: EventMultiplexer,
     ):
-        super().__init__(coro, response_type)
+        super().__init__(context, name, message, response_type)
         self._result_type = result_type
         self._event_mux = event_mux
         self._task: asyncio.Task[V] | None = None
@@ -217,9 +275,6 @@ class LongCall[R: BaseModel | None, V: BaseModel | None](Call[R, V]):
             # Execute the initial request-response communication.
             reply = await self._invoke(timeout, "accepted")
         except (asyncio.CancelledError, Exception) as e:
-            # wait_ready() can fail or be cancelled before _invoke ever awaits
-            # self._coro, in which case it must be closed explicitly here.
-            self._coro.close()
             context.close()
             self._future.set_exception(e)
             raise
@@ -547,6 +602,21 @@ class RequestBase[P: BaseModel | None, R: BaseModel | None, V: BaseModel | None]
             stream: The entity event stream, required for a long-running request.
         """
 
+    @abstractmethod
+    def create_call(
+        self,
+        context: RequestResponseContext,
+        message: P | None = None,
+        event_mux: EventMultiplexer | None = None,
+    ) -> Call[R, V]:
+        """Build a call of this request, sent once invoked.
+
+        Args:
+            context: The request context of the entity serving the request.
+            message: The message to send, for a request that declares one.
+            event_mux: The serving entity's events, required for a long-running request.
+        """
+
 
 class Request[P: BaseModel | None, R: BaseModel | None](RequestBase[P, R, R]):
     """A request that its handler answers immediately, with a response that is the whole result."""
@@ -558,6 +628,15 @@ class Request[P: BaseModel | None, R: BaseModel | None](RequestBase[P, R, R]):
         stream: StreamContext | None = None,
     ) -> CallHandler[P]:
         return CallHandler(self.message, functools.partial(run_call, func))
+
+    @override
+    def create_call(
+        self,
+        context: RequestResponseContext,
+        message: P | None = None,
+        event_mux: EventMultiplexer | None = None,
+    ) -> Call[R, R]:
+        return Call(context, self.name, message, self.response)
 
 
 class LongRequest[P: BaseModel | None, R: BaseModel | None, V: BaseModel | None](
@@ -584,6 +663,28 @@ class LongRequest[P: BaseModel | None, R: BaseModel | None, V: BaseModel | None]
             raise HandlerError("Long-running request requires an event stream")
 
         return CallHandler(self.message, functools.partial(run_long_call, func, stream))
+
+    @override
+    def create_call(
+        self,
+        context: RequestResponseContext,
+        message: P | None = None,
+        event_mux: EventMultiplexer | None = None,
+    ) -> Call[R, V]:
+        """Build a call of this request, sent once invoked.
+
+        Args:
+            context: The request context of the entity serving the request.
+            message: The message to send, for a request that declares one.
+            event_mux: The serving entity's events, which report the call's progress and result.
+
+        Raises:
+            ValueError: if no event multiplexer is given.
+        """
+        if event_mux is None:
+            raise ValueError("Long-running request requires an event multiplexer")
+
+        return LongCall(context, self.name, message, self.response, self.result, event_mux)
 
 
 def declare_request[R: BaseModel | None = None, P: BaseModel | None = None](

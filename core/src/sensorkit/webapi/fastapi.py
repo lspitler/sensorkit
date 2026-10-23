@@ -11,7 +11,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from loguru import logger
 from pydantic import BaseModel, Field, RootModel, model_validator
-from pydantic_core import to_json
 
 import sensorkit.api as sk
 from sensorkit.auto.agent import AgentConfigureRequest, AgentState, agent_configure_request
@@ -352,8 +351,7 @@ class WebAPI:
             entity, but answers 409 once its reply shows the call is long-running.
             """
             context = self.kit.backend.request(sk.Entity.at(entity_id))
-            payload = b"" if message is None else to_json(message)
-            call = Call(context.invoke(name=request_name, payload=payload), RawPayload)
+            call = Call(context, request_name, message, RawPayload)
 
             with _error_handler():
                 response = await call.invoke(timeout)

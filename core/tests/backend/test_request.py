@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
+from typing import override
 
 import pytest
+import pytest_asyncio
 from pydantic import BaseModel, ValidationError
 
-from sensorkit.backend.base import RemoteRequestError
+from sensorkit.backend.base import Backend, RemoteRequestError, Subject
 from sensorkit.backend.fake import FakeBackendImpl
 from sensorkit.backend.request import (
+    CALL_MAX_AGE,
     CallContext,
     CallError,
     CallRejected,
@@ -14,6 +17,7 @@ from sensorkit.backend.request import (
     declare_long_request,
     declare_request,
 )
+from sensorkit.core.client import SensorKit
 
 
 class Message(BaseModel):
@@ -26,6 +30,38 @@ class Response(BaseModel):
 
 class Result(BaseModel):
     val: int
+
+
+class HoldingBackendImpl(FakeBackendImpl):
+    """Fake backend that can hold request delivery and event stream startup until released."""
+
+    def __init__(self):
+        super().__init__()
+        self.requests_released = asyncio.Event()
+        self.streams_released = asyncio.Event()
+
+        self.requests_released.set()
+        self.streams_released.set()
+
+    @override
+    async def request_invoke(self, target: Subject, payload: bytes) -> bytes:
+        await self.requests_released.wait()
+        return await super().request_invoke(target, payload)
+
+    @override
+    async def stream_consume(self, target: Subject, **kwargs):
+        await self.streams_released.wait()
+        return await super().stream_consume(target, **kwargs)
+
+
+@pytest_asyncio.fixture
+async def holding_backend():
+    return HoldingBackendImpl()
+
+
+@pytest_asyncio.fixture
+async def holding_kit(holding_backend):
+    return SensorKit(Backend(impl=holding_backend))
 
 
 @pytest.mark.asyncio
@@ -103,7 +139,7 @@ async def test_request_with_invalid_message(kit):
     await sc.handle_request(request, foo_req)
 
     async with asyncio.timeout(5.0):
-        with pytest.raises(RemoteRequestError, match="validation error for Message"):
+        with pytest.raises(RemoteRequestError, match=r"validation error for CallRequest\[Message\]"):
             await kit.entity(sc.entity).call(mismatched, Response(val=1))
 
 
@@ -566,3 +602,118 @@ def test_long_request_requires_an_event_stream():
 
     with pytest.raises(HandlerError, match="event stream"):
         request.create_handler(foo_req)
+
+
+@pytest.mark.asyncio
+async def test_long_request_call_requires_events(kit):
+    """A long-running request cannot be called without the events that report its result."""
+    request = declare_long_request(name="foo", response=Response)
+
+    with pytest.raises(ValueError, match="event multiplexer"):
+        request.create_call(kit.backend.request())
+
+
+# ---- late delivery ----------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_request_delivered_late_is_rejected(holding_kit, holding_backend):
+    """A call that reaches its handler too long after it was sent is rejected without running."""
+    async with asyncio.timeout(1.0):
+        sc = await holding_kit.register_service("testservice", "0.1.0")
+
+    request = declare_request("foo", message=Message)
+    handled = []
+
+    async def foo_req(msg: Message) -> None:
+        handled.append(msg)
+
+    await sc.handle_request(request, foo_req)
+    holding_backend.requests_released.clear()
+
+    async with asyncio.timeout(5.0):
+        cli = holding_kit.entity(sc.entity)
+        call = asyncio.create_task(cli.call(request, Message(foo="bar")).run_to_completion())
+        await asyncio.sleep(CALL_MAX_AGE + 0.2)
+        holding_backend.requests_released.set()
+
+        with pytest.raises(CallRejected, match="too late"):
+            await call
+
+    assert not handled
+
+
+@pytest.mark.asyncio
+async def test_long_request_delivered_late_is_rejected(holding_kit, holding_backend):
+    """A long-running call that reaches its handler too late is rejected before it starts."""
+    async with asyncio.timeout(1.0):
+        sc = await holding_kit.register_service("testservice", "0.1.0")
+
+    request = declare_long_request("foo", result=Result)
+    started = []
+
+    async def foo_req(msg: None, call: CallContext[Result]):
+        started.append(call.call_id)
+        call.accept()
+        await call.succeed(result=Result(val=1))
+
+    await sc.handle_request(request, foo_req)
+    holding_backend.requests_released.clear()
+
+    async with asyncio.timeout(5.0):
+        cli = holding_kit.entity(sc.entity)
+        call = asyncio.create_task(cli.call(request).run_to_completion())
+        await asyncio.sleep(CALL_MAX_AGE + 0.2)
+        holding_backend.requests_released.set()
+
+        with pytest.raises(CallRejected, match="too late"):
+            await call
+
+    assert not started
+
+
+@pytest.mark.asyncio
+async def test_request_delivered_promptly_after_a_delay_is_handled(holding_kit, holding_backend):
+    """A call delayed in transit by less than the allowed age still reaches its handler."""
+    async with asyncio.timeout(1.0):
+        sc = await holding_kit.register_service("testservice", "0.1.0")
+
+    request = declare_request("foo", response=Response)
+
+    async def foo_req(msg: None) -> Response:
+        return Response(val=7)
+
+    await sc.handle_request(request, foo_req)
+    holding_backend.requests_released.clear()
+
+    async with asyncio.timeout(5.0):
+        cli = holding_kit.entity(sc.entity)
+        call = asyncio.create_task(cli.call(request).run_to_completion())
+        await asyncio.sleep(CALL_MAX_AGE / 4)
+        holding_backend.requests_released.set()
+
+        assert (await call).val == 7
+
+
+@pytest.mark.asyncio
+async def test_long_request_age_starts_when_sent(holding_kit, holding_backend):
+    """Waiting for the event stream before sending does not count toward a call's age."""
+    async with asyncio.timeout(1.0):
+        sc = await holding_kit.register_service("testservice", "0.1.0")
+
+    request = declare_long_request("foo", result=Result)
+
+    async def foo_req(msg: None, call: CallContext[Result]):
+        call.accept()
+        await call.succeed(result=Result(val=3))
+
+    await sc.handle_request(request, foo_req)
+    holding_backend.streams_released.clear()
+
+    async with asyncio.timeout(5.0):
+        cli = holding_kit.entity(sc.entity)
+        call = asyncio.create_task(cli.call(request).run_to_completion())
+        await asyncio.sleep(CALL_MAX_AGE + 0.2)
+        holding_backend.streams_released.set()
+
+        assert (await call).val == 3
