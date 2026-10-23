@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-from collections.abc import Callable
 
 import pytest
 import pytest_asyncio
@@ -49,12 +48,6 @@ async def next_report(changes: asyncio.Queue[ControllerOperatingState]):
 
     changes.task_done()
     return report
-
-
-async def wait_until(predicate: Callable[[], bool]):
-    async with asyncio.timeout(1.0):
-        while not predicate():
-            await asyncio.sleep(0.01)
 
 
 def assert_unavailable(monitor: ControllerMonitor) -> ControllerStateUnknown:
@@ -221,19 +214,19 @@ async def test_lifecycle_input_changes_notify(kit, controller_impl, monitor):
 
 
 @pytest.mark.asyncio
-async def test_bookkeeping_refreshes_state_without_notifying(kit, controller_impl, monitor):
+async def test_bookkeeping_refreshes_state_without_notifying(kit, controller_impl, monitor, until):
     with monitor.state_changes() as changes:
         await next_report(changes)
 
         await kit.controller(controller_impl.entity).disable()
-        await wait_until(lambda: not monitor.state.enable_state.enabled)
+        await until(lambda: not monitor.state.enable_state.enabled, timeout=1.0)
 
         assert changes.empty()
 
         # A new report of the same state, target and input.
         reported = monitor.operating_state.event_id
         await controller_impl.set_internal_state(UNKNOWN)
-        await wait_until(lambda: monitor.operating_state.event_id != reported)
+        await until(lambda: monitor.operating_state.event_id != reported, timeout=1.0)
 
         assert changes.empty()
 
@@ -290,9 +283,9 @@ async def test_overflow_closes_only_slow_subscriber(controller_impl, monitor):
 
 
 @pytest.mark.asyncio
-async def test_state_copies_are_isolated(controller_impl, monitor):
+async def test_state_copies_are_isolated(controller_impl, monitor, until):
     await controller_impl.set_internal_state(OPERATE, context=lifecycle_input("closed"))
-    await wait_until(lambda: monitor.operating_state.current == OPERATE)
+    await until(lambda: monitor.operating_state.current == OPERATE, timeout=1.0)
 
     monitor.state.operating_state.context.set_value("dome", "open")
     monitor.operating_state.context.set_value("dome", "open")
@@ -303,7 +296,7 @@ async def test_state_copies_are_isolated(controller_impl, monitor):
 
 
 @pytest.mark.asyncio
-async def test_reports_are_shared_apart_from_state(controller_impl, monitor):
+async def test_reports_are_shared_apart_from_state(controller_impl, monitor, until):
     with monitor.state_changes() as first, monitor.state_changes() as second:
         report = await next_report(first)
 
@@ -316,7 +309,7 @@ async def test_reports_are_shared_apart_from_state(controller_impl, monitor):
 
         reported = monitor.operating_state.event_id
         await controller_impl.set_internal_state(UNKNOWN)
-        await wait_until(lambda: monitor.operating_state.event_id != reported)
+        await until(lambda: monitor.operating_state.event_id != reported, timeout=1.0)
 
         assert first.empty()
 

@@ -6,7 +6,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import inspect
 import os
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal, cast
 
 import pytest
@@ -292,3 +294,24 @@ async def recorder(kit):
         task.cancel()
 
     await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def wait_until(predicate: Callable[[], bool | Awaitable[bool]], timeout: float = 5.0):
+    """Poll a predicate, which may be a coroutine function, until it holds.
+
+    Raises:
+        TimeoutError: If the predicate does not hold in time.
+    """
+    async with asyncio.timeout(timeout):
+        while not await _resolve(predicate()):
+            await asyncio.sleep(0.01)
+
+
+async def _resolve(result: bool | Awaitable[bool]) -> bool:
+    return await result if inspect.isawaitable(result) else result
+
+
+@pytest.fixture
+def until():
+    """Return a coroutine function that polls a predicate until it holds or times out."""
+    return wait_until
