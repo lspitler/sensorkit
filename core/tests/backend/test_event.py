@@ -112,6 +112,66 @@ async def test_event_multiplexer_all_events():
 
 
 @pytest.mark.asyncio
+async def test_event_subscription_close_preserves_buffer():
+    """Closing preserves ordered events and leaves other subscribers active."""
+    mux = EventMultiplexer()
+    subscription = mux.subscribe_all()
+    event1 = SampleEvent1(value=42)
+    event2 = SampleEvent2(name="hello")
+
+    await mux.parse_event(event1.model_dump_json().encode())
+    await mux.parse_event(event2.model_dump_json().encode())
+    subscription.close()
+    subscription.close()
+
+    with mux.all_events() as other:
+        await mux.parse_event(event1.model_dump_json().encode())
+        assert other.get_nowait() == event1
+
+    assert subscription.queue.get_nowait() == event1
+    assert subscription.queue.get_nowait() == event2
+
+    with pytest.raises(asyncio.QueueShutDown):
+        subscription.queue.get_nowait()
+
+
+@pytest.mark.asyncio
+async def test_event_subscription_context():
+    """Context exit releases observation even when its body raises."""
+    mux = EventMultiplexer()
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        with mux.subscribe_all() as subscription:
+            event = SampleEvent1(value=42)
+            await mux.parse_event(event.model_dump_json().encode())
+            assert subscription.queue.get_nowait() == event
+            raise RuntimeError("interrupted")
+
+    await mux.parse_event(event.model_dump_json().encode())
+
+    with pytest.raises(asyncio.QueueShutDown):
+        subscription.queue.get_nowait()
+
+
+@pytest.mark.asyncio
+async def test_event_subscription_close_wakes_waiter():
+    """Closing wakes a reader waiting on an empty queue."""
+    mux = EventMultiplexer()
+    subscription = mux.subscribe_all()
+
+    async def read():
+        with pytest.raises(asyncio.QueueShutDown):
+            await subscription.queue.get()
+
+    async with asyncio.TaskGroup() as tasks:
+        waiter = tasks.create_task(read())
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        subscription.close()
+        await asyncio.wait_for(waiter, timeout=1.0)
+
+
+@pytest.mark.asyncio
 async def test_event_consumer_survives_bad_event(kit, entity_impl, emitted):
     """An event that fails to parse does not stop delivery of the events behind it."""
     poison = json.dumps({"event_model": PoisonEvent.model_tag()}).encode()

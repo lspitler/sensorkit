@@ -44,6 +44,26 @@ class UnknownEvent(Event, extra="allow"):
     """Represents an event for which no corresponding model is known."""
 
 
+class EventSubscription:
+    """Own an event queue and its registration."""
+
+    def __init__(self, subscribers: set[asyncio.Queue[Event]]):
+        self.queue: asyncio.Queue[Event] = asyncio.Queue()
+        self._subscribers = subscribers
+        subscribers.add(self.queue)
+
+    def close(self):
+        """Unsubscribe and wake waiters, preserving queued events."""
+        self._subscribers.discard(self.queue)
+        self.queue.shutdown()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
 class EventMultiplexer:
     """Distributes parsed events to per-type and wildcard subscriber queues."""
 
@@ -72,6 +92,10 @@ class EventMultiplexer:
 
         for queue in itertools.chain(self._all_queues, single):
             queue.put_nowait(model)
+
+    def subscribe_all(self) -> EventSubscription:
+        """Subscribe to all events until the subscription is closed."""
+        return EventSubscription(self._all_queues)
 
     @contextlib.contextmanager
     def event_queue(self, event: type[Event]):
