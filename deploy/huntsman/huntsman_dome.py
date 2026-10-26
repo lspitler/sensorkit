@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 
 from loguru import logger
 from pydantic import BaseModel
@@ -58,11 +59,6 @@ from sensorkit.std.enclosure import (
     StandardEnclosure,
 )
 
-# IsTracking is published on the dome's stream and consumed by mount.py via
-# `dome.monitor(IsTracking)`. We MUST use the same class instance the mount
-# imports, hence importing it rather than redeclaring.
-from sensorkit.thesky.dome import IsTracking
-
 # Error classes from the TheSky transport. We share these so callers
 # (and our own retry logic) can use the same except clauses other modules use.
 from sensorkit.thesky.device import (
@@ -76,13 +72,22 @@ from sensorkit.thesky.device import (
     send_thesky_script,
 )
 
+# IsTracking is published on the dome's stream and consumed by mount.py via
+# `dome.monitor(IsTracking)`. We MUST use the same class instance the mount
+# imports, hence importing it rather than redeclaring.
+from sensorkit.thesky.dome import IsTracking
 
 # ── Musca protocol constants ────────────────────────────────────────
 
 OPEN_CMD = "Shutter_open"
 CLOSE_CMD = "Shutter_close"
+ABORT_CMD = "Shutter_abort"
 KEEP_OPEN_CMD = "Keep_dome_open"
 STATUS_CMD = "Status_update"
+
+# How long to wait for the shutter to leave Opening after Shutter_abort. Two status
+# polls: the status loop asks Musca for a snapshot every status_frequency (5 s).
+_ABORT_SETTLE_S = 10.0
 
 # Status fields the Musca sends (everything else is skipped)
 _MUSCA_STATUS_KEYS = {"Shutter", "Door", "Battery", "Solar_A", "Switch"}
@@ -112,6 +117,8 @@ class HuntsmanDomeStatus(BaseModel):
     solar_current: float | None = None
     bt_connected: bool = False
     dome_az: float | None = None
+    shutter_unsettled_seconds: float = 0.0
+    """Seconds since the shutter was last reported Open or Closed (0 while it is)."""
 
 
 # ── Config & State ───────────────────────────────────────────────────
@@ -139,7 +146,9 @@ class HuntsmanDomeConfig(BaseModel):
     # Musca shutter (Bluetooth serial)
     serial_port: str = "/dev/rfcomm0"
     heartbeat_interval: float = 60.0
-    shutter_timeout: float = 100.0
+    # A full open takes ~28 s and the Musca firmware gives up at ~50 s, reporting
+    # PartOpen. Waiting much past that only holds _op_lock against a close.
+    shutter_timeout: float = 60.0
     min_battery_voltage: float = 12.0
     reconnect_delay: float = 5.0
     max_reconnect_delay: float = 60.0
@@ -275,6 +284,10 @@ class MuscaTransport:
 # ── Musca shutter helper ─────────────────────────────────────────────
 
 
+class ShutterOpenSuperseded(Exception):
+    """An open was cancelled because a close or abort was requested after it."""
+
+
 class _MuscaShutter:
     """Encapsulates the Musca side: transport, reader loop, heartbeat,
     shutter state, and BT-drop grace period.
@@ -287,6 +300,8 @@ class _MuscaShutter:
         self.config = config
         self.transport = MuscaTransport(config)
         self.shutter: str = "unknown"
+        # Monotonic time the shutter last left Open/Closed, or None while settled
+        self._unsettled_since: float | None = None
         self.door: str = "unknown"
         self.battery_voltage: float | None = None
         self.solar_current: float | None = None
@@ -299,6 +314,13 @@ class _MuscaShutter:
         # taking this lock, so a pending close never leaves the heartbeat alive
         # behind an in-flight open.
         self._op_lock = asyncio.Lock()
+        # Opens still in progress, whether waiting for _op_lock or moving the
+        # shutter. close() and abort() cancel them rather than waiting behind them.
+        self._open_tasks: set[asyncio.Task] = set()
+        # True from sending Shutter_open until that open settles. A cancelled open
+        # leaves it set: the shutter may still be moving, and status lags by up to
+        # status_frequency, so `shutter` alone can still read Closed.
+        self._open_commanded = False
 
     # ── public state ──
 
@@ -352,6 +374,13 @@ class _MuscaShutter:
         self._heartbeat_task = None
         await self.transport.disconnect()
 
+    @property
+    def unsettled_seconds(self) -> float:
+        """Seconds since the shutter was last Open or Closed, e.g. a stalled PartOpen."""
+        if self._unsettled_since is None:
+            return 0.0
+        return time.monotonic() - self._unsettled_since
+
     async def request_fresh_status(self):
         """Ask Musca to publish a status snapshot (the reader loop will absorb it)."""
         if self.transport.connected:
@@ -360,6 +389,29 @@ class _MuscaShutter:
     # ── shutter operations ──
 
     async def open(self):
+        """Open the shutter, unless a close or abort supersedes it first.
+
+        The work runs in its own task so a superseding close() or abort() can
+        cancel it without cancelling our caller: the command handler then fails
+        with a reason instead of vanishing, which would leave the agent's call
+        to time out. Cancelling open() itself cancels the work too.
+        """
+        task = asyncio.create_task(self._open())
+        self._open_tasks.add(task)
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.wait({task})
+            raise
+        finally:
+            self._open_tasks.discard(task)
+
+        if task.cancelled():
+            raise ShutterOpenSuperseded("Shutter open superseded by a close or abort")
+        task.result()
+
+    async def _open(self):
         async with self._op_lock:
             if not self.transport.connected:
                 raise RuntimeError("Musca Bluetooth not connected — cannot open shutter")
@@ -377,42 +429,114 @@ class _MuscaShutter:
             logger.info("Opening Musca shutter")
             await self.transport.send(OPEN_CMD)
             self._keep_open = True
+            self._open_commanded = True
 
-            # Resend if shutter hasn't started moving after 5 seconds
-            await asyncio.sleep(5.0)
-            if self.shutter not in ("Open", "Opening"):
-                logger.warning("Shutter didn't respond to first open command, resending")
-                await self.transport.send(OPEN_CMD)
+            try:
+                # Resend if shutter hasn't started moving after 5 seconds
+                await asyncio.sleep(5.0)
+                if self.shutter not in ("Open", "Opening"):
+                    logger.warning("Shutter didn't respond to first open command, resending")
+                    await self.transport.send(OPEN_CMD)
 
-            await self._wait_for_shutter("Open")
+                await self._wait_for_shutter("Open")
+            except asyncio.CancelledError:
+                # Superseded: whoever cancelled us stops the motion.
+                raise
+            except BaseException:
+                self._open_commanded = False
+                raise
+
+            self._open_commanded = False
             logger.info("Musca shutter opened")
 
     async def close(self):
         # Clear the heartbeat flag before contending for the lock: if an open() is
         # still in flight, its watchdog heartbeat must stop now so the Musca auto-closes
-        # as a fallback even while our explicit close waits behind the open.
+        # as a fallback even if our explicit close cannot be sent.
         self._keep_open = False
+        # A close never waits behind an open: cancel it, so the lock frees at once.
+        await self._cancel_opens()
 
         async with self._op_lock:
-            if self.shutter == "Closed":
+            moving = self._take_open_motion()
+            if self.shutter == "Closed" and not moving:
                 return
 
             if not self.transport.connected:
                 logger.warning("BT disconnected — Musca watchdog should auto-close")
                 return
 
+            # The Musca offers only an abort while Opening (as the TCL monitor
+            # does), so stop the open before reversing it.
+            if moving:
+                await self._abort_and_settle()
+
             logger.info("Closing Musca shutter")
             await self.transport.send(CLOSE_CMD)
             await self._wait_for_shutter("Closed")
             logger.info("Musca shutter closed")
 
+    async def abort(self):
+        """Stop an in-flight open, leaving the shutter wherever it stopped.
+
+        Only an open is aborted. A close is left to finish, since closed is the
+        safe state, and an already-open shutter keeps its heartbeat: the agent
+        sends Abort for any interrupted call on this device, not just shutter
+        motion, and that must not let the watchdog close the dome mid-night.
+        """
+        if not (self._open_tasks or self._open_commanded):
+            return
+
+        self._keep_open = False
+        await self._cancel_opens()
+
+        # The cancelled opens have released _op_lock, so a holder now is a close
+        # (or a later open) that owns the shutter. Leave it be: dispatch waits only
+        # ABORT_TIMEOUT_S for our reply, and aborting a close would undo it.
+        if self._op_lock.locked():
+            return
+
+        async with self._op_lock:
+            if self._take_open_motion() and self.transport.connected:
+                logger.info("Aborting Musca shutter movement")
+                await self.transport.send(ABORT_CMD)
+
     # ── helpers ──
+
+    async def _cancel_opens(self):
+        """Cancel every open requested so far and wait until each has unwound."""
+        # Snapshot: an open requested after this call is not superseded by it.
+        tasks = set(self._open_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            logger.warning("Cancelling in-flight Musca shutter open")
+            await asyncio.wait(tasks)
+
+    def _take_open_motion(self) -> bool:
+        """Return whether a superseded open may have left the shutter moving, and clear it."""
+        moving = self._open_commanded or self.shutter == "Opening"
+        self._open_commanded = False
+        return moving
+
+    async def _abort_and_settle(self):
+        """Send Shutter_abort and give the shutter a moment to report it stopped."""
+        logger.info("Aborting Musca shutter movement")
+        await self.transport.send(ABORT_CMD)
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(_ABORT_SETTLE_S):
+                while self.shutter == "Opening":
+                    await asyncio.sleep(0.5)
 
     def _apply_status(self, msg: tuple[str, str]):
         key, value = msg
         match key:
             case "Shutter":
                 self.shutter = value
+                if value in ("Open", "Closed"):
+                    self._unsettled_since = None
+                elif self._unsettled_since is None:
+                    self._unsettled_since = time.monotonic()
             case "Door":
                 self.door = value
             case "Battery":
@@ -441,9 +565,17 @@ class _MuscaShutter:
                     await asyncio.sleep(0.5)
 
     async def _wait_for_shutter(self, target: str):
-        async with asyncio.timeout(self.config.shutter_timeout):
-            while self.shutter != target:
-                await asyncio.sleep(0.5)
+        try:
+            async with asyncio.timeout(self.config.shutter_timeout):
+                while self.shutter != target:
+                    await asyncio.sleep(0.5)
+        except TimeoutError:
+            # A bare TimeoutError has no message, so the caller's failure reason was
+            # blank. Say where the shutter stopped (usually PartOpen: Musca gave up).
+            raise TimeoutError(
+                f"Shutter did not reach {target} within "
+                f"{self.config.shutter_timeout:.0f}s (last state: {self.shutter})"
+            ) from None
 
     # ── background loops ──
 
@@ -761,6 +893,21 @@ class HuntsmanDome:
         logger.debug("stopped thesky dome")
 
     @sk.command_handler
+    async def dome_abort(self, cmd: sk.Abort):
+        """Stop an in-flight shutter open and any dome rotation.
+
+        Without this the agent cannot interrupt an open: cancelling its call does
+        not reach the handler, which kept the shutter lock until its own timeout.
+        """
+        await self._shutter.abort()
+
+        # Rotation is best-effort: an unreachable TheSky must not fail the shutter abort.
+        try:
+            await self.dome_stop(Stop())
+        except Exception as e:
+            logger.warning(f"Could not stop dome rotation during abort: {e}")
+
+    @sk.command_handler
     async def dome_home(self, cmd: Home):
         await self.require_connected()
         await self._dome_unpark()
@@ -1023,6 +1170,7 @@ class HuntsmanDome:
         await device.publish(
             HuntsmanDomeStatus(
                 shutter=self._shutter.shutter,
+                shutter_unsettled_seconds=round(self._shutter.unsettled_seconds, 1),
                 door=self._shutter.door,
                 battery_voltage=self._shutter.battery_voltage,
                 solar_current=self._shutter.solar_current,
