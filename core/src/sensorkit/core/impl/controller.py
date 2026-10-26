@@ -213,11 +213,6 @@ class TaskRun:
         )
 
 
-def _receive_task[T: Task](callback: TaskHandlerCallback[T]) -> ExecutionHandlerCallback[T]:
-    """Pass the envelope's task to the callback."""
-    return lambda execution: callback(execution.task)
-
-
 class ControllerImpl(EntityImpl, ControllerInterface):
     """Helper for implementing server-side functionality of a Controller.
 
