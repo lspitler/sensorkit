@@ -34,10 +34,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.util
+import pathlib
+import sys
 import time
+from typing import Literal
 
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import sensorkit.api as sk
 from sensorkit.astro.common import AltAzPointing
@@ -119,9 +123,26 @@ class HuntsmanDomeStatus(BaseModel):
     dome_az: float | None = None
     shutter_unsettled_seconds: float = 0.0
     """Seconds since the shutter was last reported Open or Closed (0 while it is)."""
+    rotation_policy: str = "not configured"
+    """Rotation direction the dome server reports: "both", "CW", "not configured"
+    (no `rotation_policy` in the config) or "unknown" (server not reachable)."""
 
 
 # ── Config & State ───────────────────────────────────────────────────
+
+
+class RotationPolicyConfig(BaseModel):
+    """Which way the dome may rotate. Applied by the dome server on domepi."""
+
+    allowed_direction: Literal["both", "CW"] = "both"
+    """'both' takes the shortest route; 'CW' rotates clockwise only (azimuth
+    increasing; right to left seen from outside), apart from small reverse moves."""
+    max_reverse_degrees: float = Field(5.0, ge=0, lt=180)
+    """With CW: largest counter-clockwise move still allowed (slaving corrections)."""
+    long_way_settle_seconds: float = Field(60.0, ge=0)
+    """With CW: hold a long-way move this long, dropping it if no longer needed."""
+    long_way_settle_tolerance: float = Field(5.0, ge=0)
+    """A new long-way target further than this (deg) restarts the hold."""
 
 
 class HuntsmanDomeConfig(BaseModel):
@@ -153,6 +174,14 @@ class HuntsmanDomeConfig(BaseModel):
     reconnect_delay: float = 5.0
     max_reconnect_delay: float = 60.0
     read_timeout: float = 3.0
+
+    # Dome rotation server on domepi (gRPC; the same server TheSkyX's dome driver
+    # uses). Only contacted when rotation_policy is set.
+    dome_server: str = "192.168.80.97:50051"
+    # Omit to leave the dome server's own setting alone (default: shortest route).
+    rotation_policy: RotationPolicyConfig | None = None
+    # How often to check the server still has our policy (e.g. after a reboot).
+    rotation_policy_check_interval: float = 60.0
 
 
 # Unified-config section. Lets the dome's settings live under a top-level
@@ -634,6 +663,117 @@ class _MuscaShutter:
                     logger.warning("Musca heartbeat failed — link may be down")
 
 
+# ── Dome rotation policy (gRPC to the dome server) ───────────────────
+
+
+def _load_hx2dome_stubs():
+    """Import the generated hx2dome gRPC stubs that sit next to this file.
+
+    This module is loaded by path, so its directory is not on sys.path. The
+    _grpc stub does `import hx2dome_pb2`, so register that first.
+    """
+    here = pathlib.Path(__file__).parent
+    modules = []
+    for name in ("hx2dome_pb2", "hx2dome_pb2_grpc"):
+        if name not in sys.modules:
+            spec = importlib.util.spec_from_file_location(name, here / f"{name}.py")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+        modules.append(sys.modules[name])
+    return modules
+
+
+class _RotationPolicyClient:
+    """Keeps the dome server's rotation policy in line with our config.
+
+    Pushes the configured policy at start, then checks it every
+    `rotation_policy_check_interval` and pushes again if the server differs
+    (it reverts to its own config file whenever it restarts). The server
+    refuses a change while the dome is moving; that is retried on the next
+    check. Never raises: failures are logged and reported as "unknown".
+    """
+
+    RPC_TIMEOUT = 5.0
+
+    def __init__(self, config: HuntsmanDomeConfig):
+        self.config = config
+        self.policy = config.rotation_policy
+        self.state = "not configured" if self.policy is None else "unknown"
+        self._task: asyncio.Task | None = None
+        self._channel = None
+        self._stub = None
+        self._pb = None
+
+    def start(self):
+        if self.policy is None:
+            return
+        self._task = asyncio.create_task(self._loop())
+
+    async def stop(self):
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+        if self._channel is not None:
+            await self._channel.close()
+            self._channel = None
+
+    async def _loop(self):
+        while True:
+            try:
+                await self.sync()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._set_state("unknown", f"dome server not reachable: {e}")
+            await asyncio.sleep(self.config.rotation_policy_check_interval)
+
+    async def sync(self):
+        """Read the server's policy and push ours if it differs."""
+        if self._stub is None:
+            import grpc
+
+            self._pb, pb_grpc = _load_hx2dome_stubs()
+            self._channel = grpc.aio.insecure_channel(self.config.dome_server)
+            self._stub = pb_grpc.HX2DomeStub(self._channel)
+
+        current = await self._stub.dapiGetRotationPolicy(
+            self._pb.Empty(), timeout=self.RPC_TIMEOUT
+        )
+        if self._matches(current):
+            self._set_state(current.allowed_direction)
+            return
+
+        reply = await self._stub.dapiSetRotationPolicy(
+            self._pb.RotationPolicy(**self.policy.model_dump()), timeout=self.RPC_TIMEOUT
+        )
+        match reply.return_code:
+            case 0:
+                self._set_state(self.policy.allowed_direction)
+                logger.info(f"Dome rotation policy set: {self.policy.model_dump()}")
+            case 1:
+                # Refused while the dome moves; keep reporting what is in effect.
+                self._set_state(current.allowed_direction)
+                logger.info("Dome is moving; rotation policy will be retried")
+            case _:
+                self._set_state("unknown", f"dome server rejected the policy: {reply.error_message}")
+
+    def _matches(self, current) -> bool:
+        want = self.policy
+        return current.allowed_direction == want.allowed_direction and all(
+            abs(getattr(current, f) - getattr(want, f)) < 1e-6
+            for f in ("max_reverse_degrees", "long_way_settle_seconds", "long_way_settle_tolerance")
+        )
+
+    def _set_state(self, state: str, reason: str = ""):
+        if state != self.state:
+            message = f"Dome rotation policy now {state}" + (f" ({reason})" if reason else "")
+            (logger.warning if state == "unknown" else logger.info)(message)
+        self.state = state
+
+
 # ── Dome ─────────────────────────────────────────────────────────────
 
 
@@ -645,6 +785,7 @@ class HuntsmanDome:
         self.config = config
         self.state = HuntsmanDomeState()
         self._shutter = _MuscaShutter(config)
+        self._rotation = _RotationPolicyClient(config)
         self._script_lock = asyncio.Lock()
         self._thesky_connected = False
         self._dome_az: float | None = None
@@ -784,6 +925,10 @@ class HuntsmanDome:
         # reads status; the shutter is not touched.
         await self._shutter.start()
 
+        # Keep the dome server's rotation direction policy in line with config.
+        # Talks only to the dome server; does not move the dome.
+        self._rotation.start()
+
         # Start status loop.
         self.start_status_loop()
 
@@ -794,6 +939,7 @@ class HuntsmanDome:
         await self.dome_deinit(Deinit())
 
         await self.stop_status_loop()
+        await self._rotation.stop()
         await self._shutter.stop()
 
         try:
@@ -1176,6 +1322,7 @@ class HuntsmanDome:
                 solar_current=self._shutter.solar_current,
                 bt_connected=self._shutter.bt_connected,
                 dome_az=self._dome_az,
+                rotation_policy=self._rotation.state,
             )
         )
 
