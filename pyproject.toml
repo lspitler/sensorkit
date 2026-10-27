@@ -112,17 +112,6 @@ slack = [
 systemd = [
     "systemd-python==235; sys_platform == 'linux'",
 ]
-# The Huntsman deployment (deploy/huntsman): Musca shutter over Bluetooth
-# serial, the dome server's rotation policy over gRPC, and the USB hub that
-# huntsman_dome_watchdog.py power-cycles.
-huntsman = [
-    "sensorkit[thesky]",
-    "pyserial>=3.5",
-    "pyserial-asyncio>=0.6",
-    "grpcio>=1.80,<1.81",  # match the dome server on domepi
-    "protobuf>=6.31",
-    "brainstem>=2.12",
-]
 thesky = []
 thesky-simulator = [
     "dukpy>=0.5.0",

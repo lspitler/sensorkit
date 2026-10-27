@@ -34,9 +34,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import importlib.util
-import pathlib
-import sys
 import time
 from typing import Literal
 
@@ -667,21 +664,20 @@ class _MuscaShutter:
 
 
 def _load_hx2dome_stubs():
-    """Import the generated hx2dome gRPC stubs that sit next to this file.
+    """Import the hx2dome gRPC stubs (generated from huntsman-dome's hx2dome.proto).
 
-    This module is loaded by path, so its directory is not on sys.path. The
-    _grpc stub does `import hx2dome_pb2`, so register that first.
+    They are not committed here: the deployment environment generates them
+    (see /opt/huntsman). Imported only when a rotation policy is configured.
     """
-    here = pathlib.Path(__file__).parent
-    modules = []
-    for name in ("hx2dome_pb2", "hx2dome_pb2_grpc"):
-        if name not in sys.modules:
-            spec = importlib.util.spec_from_file_location(name, here / f"{name}.py")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[name] = module
-            spec.loader.exec_module(module)
-        modules.append(sys.modules[name])
-    return modules
+    try:
+        import hx2dome_pb2
+        import hx2dome_pb2_grpc
+    except ImportError as e:
+        raise RuntimeError(
+            "hx2dome gRPC stubs not found; generate them from huntsman-dome's "
+            "hx2dome.proto into the deployment environment"
+        ) from e
+    return hx2dome_pb2, hx2dome_pb2_grpc
 
 
 class _RotationPolicyClient:

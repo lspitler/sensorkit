@@ -1,13 +1,19 @@
 """Dome rotation policy client against an in-process fake dome server (gRPC, no domepi).
 
-Run from /opt/sensorkit:
-    .venv/bin/python -m pytest -p no:cacheprovider deploy/huntsman/tests -q
+Needs grpcio and the hx2dome stubs. If the stubs are not importable, they are
+generated from HX2DOME_PROTO (default: huntsman-dome's copy at
+/opt/huntsman-dome-new/domehunter/gRPC-TheSkyX-driver/hx2dome.proto) with
+grpcio-tools; otherwise the module is skipped. Run with the deployment env:
+    /opt/huntsman/.venv/bin/python -m pytest -p no:cacheprovider deploy/huntsman/tests -q
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
+import pathlib
 import sys
+import tempfile
 
 import pytest
 import pytest_asyncio
@@ -15,7 +21,27 @@ import pytest_asyncio
 grpc = pytest.importorskip("grpc")
 
 hd = sys.modules["huntsman_dome_under_test"]  # loaded once by conftest.py
-pb, pb_grpc = hd._load_hx2dome_stubs()
+
+_DEFAULT_PROTO = "/opt/huntsman-dome-new/domehunter/gRPC-TheSkyX-driver/hx2dome.proto"
+
+
+def _stubs():
+    try:
+        return hd._load_hx2dome_stubs()
+    except RuntimeError:
+        pass
+    protoc = pytest.importorskip("grpc_tools.protoc").main
+    proto = pathlib.Path(os.environ.get("HX2DOME_PROTO", _DEFAULT_PROTO))
+    if not proto.exists():
+        pytest.skip(f"hx2dome stubs not installed and {proto} not found", allow_module_level=True)
+    out = tempfile.mkdtemp(prefix="hx2dome_stubs_")
+    args = ["", f"-I{proto.parent}", f"--python_out={out}", f"--grpc_python_out={out}", str(proto)]
+    assert protoc(args) == 0, "protoc failed on hx2dome.proto"
+    sys.path.insert(0, out)
+    return hd._load_hx2dome_stubs()
+
+
+pb, pb_grpc = _stubs()
 
 
 class FakeDomeServer(pb_grpc.HX2DomeServicer):
